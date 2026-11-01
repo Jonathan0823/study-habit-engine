@@ -189,6 +189,39 @@ def _payload(update_id, command, arguments):
     }
 
 
+def test_progress_add_today_keeps_current_plan_available(block_client):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    today_date = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+
+    async def expand_budget():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute("UPDATE study_days SET budget_minutes=90")
+        finally:
+            await conn.close()
+
+    asyncio.run(expand_budget())
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(87, "progress", ["add", "arrays", "5", today_date.isoformat()]),
+    )
+    token = _confirmation_token(preview, "progress confirm")
+    result = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(88, "progress", ["confirm", token]),
+    )
+    assert result.json()["result"]["code"] == "PROGRESS_RECORDED"
+    today = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(91, "today", []),
+    )
+    assert today.json()["result"]["code"] == "PLAN_READY"
+
+
 def test_progress_add_today_over_capacity_marks_queue_for_replan(block_client):
     client, _, _ = block_client
     headers = {"Authorization": "Bearer bot-secret"}
@@ -574,6 +607,15 @@ def test_done_prefills_duration_records_once_and_invalidates_over_budget_queue(
     assert day_state == "replan_required"
     assert study_minutes == 40
 
+    async def plan_revision():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return await conn.fetchval("SELECT state_revision FROM plans")
+        finally:
+            await conn.close()
+
+    assert asyncio.run(plan_revision()) == 0
+
     stale = client.post(
         "/v1/telegram/updates",
         headers=headers,
@@ -665,6 +707,12 @@ def test_stale_confirmation_rejected_then_fresh_revision_succeeds(block_client):
     )
     assert confirmed.json()["result"]["code"] == "BLOCK_DONE"
     assert asyncio.run(persisted()) == (1, "done", 3, 1)
+    today = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(144, "today", []),
+    )
+    assert today.json()["result"]["code"] == "PLAN_READY"
 
 
 def test_zero_done_closes_block_without_starting_topic(block_client):
@@ -819,6 +867,10 @@ def test_complete_topic_requires_confirmation_and_replay_is_idempotent(block_cli
             await conn.execute(
                 "INSERT INTO topic_progress(topic_id,completed,study_minutes) VALUES('arrays',false,23)"
             )
+            await conn.execute(
+                "INSERT INTO study_blocks(block_id,plan_id,position,topic_id,planned_minutes) SELECT $1,plan_id,2,'strings',20 FROM plans",
+                uuid.uuid4(),
+            )
         finally:
             await conn.close()
 
@@ -834,19 +886,25 @@ def test_complete_topic_requires_confirmation_and_replay_is_idempotent(block_cli
     client.post("/v1/telegram/updates", headers=headers, json=confirm)
     replay = client.post("/v1/telegram/updates", headers=headers, json=confirm)
     assert replay.json()["result"]["code"] == "TOPIC_COMPLETED"
+    today_after_completion = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(302, "today", []),
+    )
+    assert today_after_completion.json()["result"]["code"] == "PLAN_READY"
     second_replay = client.post(
         "/v1/telegram/updates",
         headers=headers,
-        json=_payload(302, "complete_topic", [token]),
+        json=_payload(306, "complete_topic", [token]),
     )
     assert second_replay.json()["result"]["code"] == "TOPIC_COMPLETED"
     reopen_preview = client.post(
         "/v1/telegram/updates",
         headers=headers,
-        json=_payload(303, "complete_topic", ["arrays"]),
+        json=_payload(307, "complete_topic", ["arrays"]),
     )
     reopen_token = _confirmation_token(reopen_preview, "complete_topic")
-    reopen_confirm = _payload(304, "complete_topic", [reopen_token])
+    reopen_confirm = _payload(308, "complete_topic", [reopen_token])
     assert (
         client.post(
             "/v1/telegram/updates", headers=headers, json=reopen_confirm
@@ -859,6 +917,24 @@ def test_complete_topic_requires_confirmation_and_replay_is_idempotent(block_cli
         ).json()["result"]["code"]
         == "TOPICS_REOPENED"
     )
+    today_after_reopen = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(309, "today", []),
+    )
+    assert today_after_reopen.json()["result"]["code"] == "PLAN_READY"
+
+    async def revisions():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return await conn.fetchrow(
+                "SELECT p.state_revision AS plan_revision,s.state_revision AS engine_revision FROM plans p CROSS JOIN engine_state s"
+            )
+        finally:
+            await conn.close()
+
+    revision = asyncio.run(revisions())
+    assert revision["plan_revision"] == revision["engine_revision"]
 
     async def persisted():
         conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
@@ -890,7 +966,7 @@ def test_complete_topic_requires_confirmation_and_replay_is_idempotent(block_cli
     assert (completed, block_status, pending_count, session_count, delivery_count) == (
         False,
         "cancelled",
-        0,
+        1,
         0,
         1,
     )

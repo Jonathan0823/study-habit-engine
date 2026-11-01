@@ -425,6 +425,14 @@ async def handle_topic_command(
                 await conn.execute(
                     "UPDATE engine_state SET state_revision=state_revision+1,progress_revision=progress_revision+1 WHERE singleton=true"
                 )
+                if (
+                    next_state != "replan_required"
+                    and day["current_plan_id"] is not None
+                ):
+                    await conn.execute(
+                        "UPDATE plans SET state_revision=(SELECT state_revision FROM engine_state WHERE singleton=true) WHERE plan_id=$1",
+                        day["current_plan_id"],
+                    )
                 text, code = (
                     f"Reopened {', '.join(sorted(reopened))}. Recorded study time and history were preserved; use /replan to refresh the queue.",
                     "TOPICS_REOPENED",
@@ -467,6 +475,14 @@ async def handle_topic_command(
                 await conn.execute(
                     "UPDATE engine_state SET state_revision=state_revision+1,progress_revision=progress_revision+1 WHERE singleton=true"
                 )
+                if (
+                    day["state"] != "replan_required"
+                    and day["current_plan_id"] is not None
+                ):
+                    await conn.execute(
+                        "UPDATE plans SET state_revision=(SELECT state_revision FROM engine_state WHERE singleton=true) WHERE plan_id=$1",
+                        day["current_plan_id"],
+                    )
                 text, code = (
                     f"Completed {topic_id}. The queue was not refilled.",
                     "TOPIC_COMPLETED",
@@ -827,6 +843,19 @@ async def handle_progress_command(conn, operation_id, arguments, actor_id, chat_
                         await conn.execute(
                             "UPDATE engine_state SET state_revision=state_revision+1,progress_revision=progress_revision+1 WHERE singleton=true"
                         )
+                        if not replan_required:
+                            current_day = await conn.fetchrow(
+                                "SELECT state,current_plan_id FROM study_days WHERE study_date=$1",
+                                today,
+                            )
+                            if (
+                                current_day["state"] != "replan_required"
+                                and current_day["current_plan_id"] is not None
+                            ):
+                                await conn.execute(
+                                    "UPDATE plans SET state_revision=(SELECT state_revision FROM engine_state WHERE singleton=true) WHERE plan_id=$1",
+                                    current_day["current_plan_id"],
+                                )
                         if replan_required and past_progress_staled_plan:
                             text, code = (
                                 f"Recorded session {session_id} for {new_day}: {context['minutes']} minutes. Today's plan is stale because historical progress changed; queue history is preserved. Use /replan to refresh it.",
@@ -931,6 +960,15 @@ async def handle_progress_command(conn, operation_id, arguments, actor_id, chat_
                         await conn.execute(
                             "UPDATE engine_state SET state_revision=state_revision+1,progress_revision=progress_revision+1 WHERE singleton=true"
                         )
+                        if (
+                            not invalid_topics
+                            and day["state"] != "replan_required"
+                            and day["current_plan_id"] is not None
+                        ):
+                            await conn.execute(
+                                "UPDATE plans SET state_revision=(SELECT state_revision FROM engine_state WHERE singleton=true) WHERE plan_id=$1",
+                                day["current_plan_id"],
+                            )
                         text, code = (
                             f"Reopened {', '.join(sorted(reopened))}. Recorded study time and history were preserved; use /replan to refresh the queue if needed.",
                             "TOPICS_REOPENED",
@@ -1465,6 +1503,11 @@ async def handle_block_command(
                 await conn.execute(
                     "UPDATE engine_state SET state_revision=state_revision+1 WHERE singleton=true"
                 )
+                if code == "BLOCK_DONE" and day["current_plan_id"] is not None:
+                    await conn.execute(
+                        "UPDATE plans SET state_revision=(SELECT state_revision FROM engine_state WHERE singleton=true) WHERE plan_id=$1",
+                        day["current_plan_id"],
+                    )
         else:
             await conn.execute(
                 "UPDATE study_blocks SET status='skipped' WHERE block_id=$1 AND status='pending'",

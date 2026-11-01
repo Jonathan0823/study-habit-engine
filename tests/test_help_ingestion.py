@@ -146,7 +146,7 @@ def test_curriculum_module_imports_independently():
 def test_shared_help_explains_confirmation_and_topic_selection():
     text = help_text()
     assert (
-        "/done [block_id] [queue_revision actual_minutes] - Choose a pending block, then confirm with its current queue revision and actual minutes"
+        "/done [block_id] | <token> <actual_minutes> - Select a pending block by ID, then confirm with the displayed token and actual minutes"
         in text
     )
     assert (
