@@ -7,7 +7,14 @@ engine_is_usable() {
   command -v "$engine" >/dev/null 2>&1 || return 1
   "$engine" info >/dev/null 2>&1 || return 1
   "$@" version >/dev/null 2>&1 || return 1
-  "$@" ls >/dev/null 2>&1
+  env \
+    BOT_SERVICE_TOKEN="${BOT_SERVICE_TOKEN:-ci-probe}" \
+    ADMIN_SERVICE_TOKEN="${ADMIN_SERVICE_TOKEN:-ci-probe}" \
+    TELEGRAM_BOT_ID="${TELEGRAM_BOT_ID:-1}" \
+    TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-1}" \
+    TELEGRAM_PRIVATE_CHAT_ID="${TELEGRAM_PRIVATE_CHAT_ID:-1}" \
+    TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-ci-probe}" \
+    "$@" ps >/dev/null 2>&1
 }
 
 compose_project="study-habit-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$"
