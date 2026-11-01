@@ -387,6 +387,313 @@ def test_curriculum_import_preview_and_activate_exact_version(client):
     assert duplicate.json() == activated.json()
 
 
+def test_revision_mapping_previews_and_carries_completion_without_moving_minutes(
+    client,
+):
+    headers = {"Authorization": "Bearer admin-secret"}
+    original = client.post(
+        "/v1/admin/curricula/import",
+        json=valid_curriculum("old"),
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    first_preview = client.post(
+        f"/v1/admin/curricula/{original['version']}/preview",
+        json={"mapping": []},
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    assert (
+        client.post(
+            f"/v1/admin/confirmations/{first_preview['confirmation_token']}",
+            json={},
+            headers=admin_idempotency_headers(headers),
+        ).status_code
+        == 200
+    )
+
+    async def seed_history():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE topic_progress SET completed=true,study_minutes=37 WHERE topic_id='old'"
+            )
+            await conn.execute(
+                "INSERT INTO study_sessions(session_id,topic_id,study_date,actual_minutes) VALUES($1,'old',CURRENT_DATE,37)",
+                uuid.uuid4(),
+            )
+            await conn.execute(
+                "INSERT INTO study_days(study_date,state,queue_revision) VALUES(CURRENT_DATE,'valid',4)"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(seed_history())
+    revised = {
+        "topics": [
+            {
+                **valid_curriculum("new")["topics"][0],
+                "description": "Revised objective",
+                "position": 0,
+            },
+        ]
+    }
+    imported = client.post(
+        "/v1/admin/curricula/import",
+        json=revised,
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    mapping = [
+        {"from_topic_ids": ["old"], "to_topic_id": "new", "carry_completion": True}
+    ]
+    preview = client.post(
+        f"/v1/admin/curricula/{imported['version']}/preview",
+        json={"mapping": mapping},
+        headers=admin_idempotency_headers(headers),
+    )
+    assert preview.status_code == 200
+    assert preview.json()["removed_topic_ids"] == ["old"]
+    assert preview.json()["new_topic_ids"] == ["new"]
+    assert preview.json()["completion_carryover_topic_ids"] == ["new"]
+    assert preview.json()["queue_impact"][0]["will_invalidate"] is True
+    activated = client.post(
+        f"/v1/admin/confirmations/{preview.json()['confirmation_token']}",
+        json={},
+        headers=admin_idempotency_headers(headers),
+    )
+    assert activated.status_code == 200
+
+    async def verify_history():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            source = await conn.fetchrow(
+                "SELECT completed,study_minutes FROM topic_progress WHERE topic_id='old'"
+            )
+            target = await conn.fetchrow(
+                "SELECT completed,study_minutes FROM topic_progress WHERE topic_id='new'"
+            )
+            total = await conn.fetchval(
+                "SELECT sum(actual_minutes) FROM study_sessions WHERE topic_id='old'"
+            )
+            queue = await conn.fetchrow(
+                "SELECT state,queue_revision FROM study_days WHERE study_date=CURRENT_DATE"
+            )
+            return source, target, total, queue
+        finally:
+            await conn.close()
+
+    source, target, total, queue = asyncio.run(verify_history())
+    assert tuple(source.values()) == (True, 37)
+    assert tuple(target.values()) == (True, 0)
+    assert total == 37
+    assert tuple(queue.values()) == ("replan_required", 5)
+
+
+def test_transitive_prerequisite_invalidation_matches_activation(client):
+    headers = {"Authorization": "Bearer admin-secret"}
+    old_topics = [
+        {**valid_curriculum("root")["topics"][0], "position": 0},
+        {
+            **valid_curriculum("b")["topics"][0],
+            "position": 1,
+            "prerequisites": ["root"],
+        },
+        {**valid_curriculum("c")["topics"][0], "position": 2, "prerequisites": ["b"]},
+        {**valid_curriculum("d")["topics"][0], "position": 3, "prerequisites": ["c"]},
+    ]
+    original = client.post(
+        "/v1/admin/curricula/import",
+        json={"topics": old_topics},
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    first_preview = client.post(
+        f"/v1/admin/curricula/{original['version']}/preview",
+        json={"mapping": []},
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    assert (
+        client.post(
+            f"/v1/admin/confirmations/{first_preview['confirmation_token']}",
+            json={},
+            headers=admin_idempotency_headers(headers),
+        ).status_code
+        == 200
+    )
+
+    async def mark_chain_complete():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE topic_progress SET completed=true,study_minutes=11"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(mark_chain_complete())
+    new_topics = [
+        {**old_topics[0], "prerequisites": ["new-root"]},
+        *old_topics[1:],
+        {**valid_curriculum("new-root")["topics"][0], "position": 4},
+    ]
+    revised = client.post(
+        "/v1/admin/curricula/import",
+        json={"topics": new_topics},
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    preview = client.post(
+        f"/v1/admin/curricula/{revised['version']}/preview",
+        json={"mapping": []},
+        headers=admin_idempotency_headers(headers),
+    )
+    assert preview.status_code == 200
+    invalidated = preview.json()["prerequisite_invalidated_topic_ids"]
+    assert invalidated == ["b", "c", "d", "root"]
+    activation = client.post(
+        f"/v1/admin/confirmations/{preview.json()['confirmation_token']}",
+        json={},
+        headers=admin_idempotency_headers(headers),
+    )
+    assert activation.status_code == 200
+
+    async def read_completion():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            rows = await conn.fetch(
+                "SELECT topic_id,completed,study_minutes FROM topic_progress WHERE topic_id = ANY($1::text[])",
+                invalidated,
+            )
+            return {
+                row["topic_id"]: (row["completed"], row["study_minutes"])
+                for row in rows
+            }
+        finally:
+            await conn.close()
+
+    after = asyncio.run(read_completion())
+    assert set(after) == set(invalidated)
+    assert all(
+        completed is False and minutes == 11 for completed, minutes in after.values()
+    )
+
+
+def test_changed_objective_mapping_cannot_retain_source_identity_or_minutes(client):
+    headers = {"Authorization": "Bearer admin-secret"}
+    original = client.post(
+        "/v1/admin/curricula/import",
+        json=valid_curriculum("same"),
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    preview = client.post(
+        f"/v1/admin/curricula/{original['version']}/preview",
+        json={"mapping": []},
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    assert (
+        client.post(
+            f"/v1/admin/confirmations/{preview['confirmation_token']}",
+            json={},
+            headers=admin_idempotency_headers(headers),
+        ).status_code
+        == 200
+    )
+
+    async def seed_minutes():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE topic_progress SET study_minutes=23 WHERE topic_id='same'"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(seed_minutes())
+    revised_content = {
+        "topics": [
+            {
+                **valid_curriculum("same")["topics"][0],
+                "description": "A changed objective",
+                "position": 0,
+            },
+            {**valid_curriculum("target")["topics"][0], "position": 1},
+        ]
+    }
+    revised = client.post(
+        "/v1/admin/curricula/import",
+        json=revised_content,
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    rejected = client.post(
+        f"/v1/admin/curricula/{revised['version']}/preview",
+        json={
+            "mapping": [
+                {
+                    "from_topic_ids": ["same"],
+                    "to_topic_id": "target",
+                    "carry_completion": False,
+                }
+            ]
+        },
+        headers=admin_idempotency_headers(headers),
+    )
+    assert rejected.status_code == 422
+    assert "must be retired" in rejected.json()["detail"]["message"]
+
+    async def verify_source_history():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return await conn.fetchval(
+                "SELECT study_minutes FROM topic_progress WHERE topic_id='same'"
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(verify_source_history()) == 23
+
+
+def test_non_valid_queue_revision_change_stales_preview(client):
+    headers = {"Authorization": "Bearer admin-secret"}
+
+    async def seed_non_valid_queue():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO study_days(study_date,state,queue_revision) VALUES(CURRENT_DATE - 1,'replan_required',2)"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(seed_non_valid_queue())
+    imported = client.post(
+        "/v1/admin/curricula/import",
+        json=valid_curriculum("queue"),
+        headers=admin_idempotency_headers(headers),
+    ).json()
+    preview = client.post(
+        f"/v1/admin/curricula/{imported['version']}/preview",
+        json={"mapping": []},
+        headers=admin_idempotency_headers(headers),
+    )
+    assert preview.status_code == 200
+    assert preview.json()["queue_impact"][0]["state"] == "replan_required"
+    assert preview.json()["queue_impact"][0]["will_invalidate"] is False
+
+    async def revise_queue():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE study_days SET queue_revision=3 WHERE study_date=CURRENT_DATE - 1"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(revise_queue())
+    activated = client.post(
+        f"/v1/admin/confirmations/{preview.json()['confirmation_token']}",
+        json={},
+        headers=admin_idempotency_headers(headers),
+    )
+    assert activated.status_code == 409
+    assert activated.json()["detail"]["code"] == "STALE_PREVIEW"
+
+
 def valid_curriculum(topic_id="one"):
     return {
         "topics": [
