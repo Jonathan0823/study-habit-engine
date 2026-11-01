@@ -10,10 +10,12 @@ else
   exit 1
 fi
 trap '"${compose[@]}" down -v' EXIT
+DB_HOST_PORT=$(uv run python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+export DB_HOST_PORT
 uv sync --group test
 export TELEGRAM_BOT_TOKEN=test-token
-export DATABASE_URL=postgresql://study_runtime:study-runtime-local@127.0.0.1:5432/study
-export MIGRATION_DATABASE_URL=postgresql://postgres:postgres-local-only@127.0.0.1:5432/study
+export DATABASE_URL="postgresql://study_runtime:study-runtime-local@127.0.0.1:${DB_HOST_PORT}/study"
+export MIGRATION_DATABASE_URL="postgresql://postgres:postgres-local-only@127.0.0.1:${DB_HOST_PORT}/study"
 export BOT_SERVICE_TOKEN=bot-secret
 export ADMIN_SERVICE_TOKEN=admin-secret
 export TELEGRAM_BOT_ID=12345

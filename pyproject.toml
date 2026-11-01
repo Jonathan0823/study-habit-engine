@@ -7,6 +7,9 @@ dependencies = [
   "uvicorn[standard]==0.34.2",
   "asyncpg==0.30.0",
   "pydantic==2.11.4",
+  "langgraph==0.6.11",
+  "langgraph-checkpoint-postgres==2.0.25",
+  "psycopg[binary]==3.3.6",
 ]
 
 [dependency-groups]

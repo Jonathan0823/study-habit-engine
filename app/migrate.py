@@ -3,6 +3,8 @@ import os
 import re
 
 import asyncpg
+import psycopg
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from app.db import apply_schema
 
@@ -14,6 +16,10 @@ async def migrate() -> None:
         raise ValueError("invalid runtime role name")
 
     await apply_schema(database_url)
+    async with await psycopg.AsyncConnection.connect(
+        database_url, autocommit=True
+    ) as checkpoint_connection:
+        await AsyncPostgresSaver(checkpoint_connection).setup()
     connection = await asyncpg.connect(database_url)
     try:
         database = await connection.fetchval("SELECT current_database()")

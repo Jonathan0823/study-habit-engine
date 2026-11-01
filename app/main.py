@@ -212,7 +212,7 @@ async def ingest(body: Update):
             and actor_id == chat_id
         )
         defined_command = any(name == body.payload.command for name, _, _ in COMMANDS)
-        implemented_command = body.payload.command == "help"
+        implemented_command = body.payload.command in ("help", "today", "replan")
         operation_id = uuid.uuid4()
         status = "accepted" if authorized and implemented_command else "rejected"
         result_code = (
@@ -223,6 +223,8 @@ async def ingest(body: Update):
             else "NOT_IMPLEMENTED"
             if not implemented_command
             else "HELP_READY"
+            if body.payload.command == "help"
+            else "PLAN_ACCEPTED"
         )
         result = {
             "operation_id": str(operation_id),
@@ -245,7 +247,7 @@ async def ingest(body: Update):
             operation_id,
             request_hash,
         )
-        if status == "accepted":
+        if status == "accepted" and body.payload.command == "help":
             await conn.execute(
                 """INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload)
                    VALUES($1,$2,$3,'help',jsonb_build_object('text',$4::text))""",
@@ -254,6 +256,184 @@ async def ingest(body: Update):
                 operation_id,
                 help_text(),
             )
+        elif status == "accepted" and body.payload.command == "replan":
+            from datetime import datetime
+
+            from app.planning import JAKARTA
+
+            study_date = datetime.now(JAKARTA).date()
+            await conn.execute(
+                "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT(study_date) DO NOTHING",
+                study_date,
+            )
+            # Lock in the same job -> day order as the worker. Marking any prior
+            # active generation terminal frees the per-day active-job constraint.
+            old_jobs = await conn.fetch(
+                "SELECT * FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE",
+                study_date,
+            )
+            day = await conn.fetchrow(
+                "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", study_date
+            )
+            for old_job in old_jobs:
+                old_operations = await conn.fetch(
+                    "SELECT operation_id FROM planning_job_operations WHERE job_id=$1 UNION SELECT $2::uuid",
+                    old_job["job_id"],
+                    old_job["operation_id"],
+                )
+                for old_operation in old_operations:
+                    old_operation_id = old_operation["operation_id"]
+                    await conn.execute(
+                        "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code','PLAN_SUPERSEDED','reason','PLAN_SUPERSEDED')) WHERE operation_id=$1",
+                        old_operation_id,
+                    )
+                    await conn.execute(
+                        "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'today',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                        uuid.uuid4(),
+                        f"operation:{old_operation_id}:today",
+                        old_operation_id,
+                        "A newer planning request replaced this one; use /today to see the current queue.",
+                    )
+                await conn.execute(
+                    "UPDATE planning_jobs SET status='completed',result=$2::jsonb,lease_until=NULL WHERE job_id=$1",
+                    old_job["job_id"],
+                    json.dumps({"reason": "PLAN_SUPERSEDED"}),
+                )
+            generation = day["requested_generation"] + 1
+            await conn.execute(
+                "UPDATE study_days SET requested_generation=$2,state='replan_required' WHERE study_date=$1",
+                study_date,
+                generation,
+            )
+            job_id = uuid.uuid4()
+            await conn.execute(
+                "INSERT INTO planning_jobs(job_id,operation_id,study_date,generation) VALUES($1,$2,$3,$4)",
+                job_id,
+                operation_id,
+                study_date,
+                generation,
+            )
+            await conn.execute(
+                "INSERT INTO planning_job_operations(operation_id,job_id) VALUES($1,$2)",
+                operation_id,
+                job_id,
+            )
+        elif status == "accepted" and body.payload.command == "today":
+            from datetime import datetime
+
+            from app.planning import JAKARTA
+
+            study_date = datetime.now(JAKARTA).date()
+            day = await conn.fetchrow(
+                """INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT(study_date)
+                   DO UPDATE SET study_date=EXCLUDED.study_date RETURNING *""",
+                study_date,
+            )
+            if day["state"] == "replan_required":
+                await conn.execute(
+                    "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code','REPLAN_REQUIRED')) WHERE operation_id=$1",
+                    operation_id,
+                )
+                await conn.execute(
+                    "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'today',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                    uuid.uuid4(),
+                    f"operation:{operation_id}:today",
+                    operation_id,
+                    "Today's queue needs to be refreshed. Use /replan to create a replacement queue.",
+                )
+            else:
+                if day["state"] == "valid" and day["current_plan_id"] is not None:
+                    plan = await conn.fetchrow(
+                        """SELECT p.curriculum_id,p.state_revision,v.status,v.content
+                           FROM plans p JOIN curriculum_versions v ON v.curriculum_id=p.curriculum_id
+                           JOIN engine_state s ON s.singleton=true
+                           WHERE p.plan_id=$1 AND p.study_date=$2 AND p.curriculum_id=s.active_curriculum_id
+                             AND p.state_revision=s.state_revision AND v.status='approved'""",
+                        day["current_plan_id"],
+                        study_date,
+                    )
+                    rows = (
+                        await conn.fetch(
+                            "SELECT topic_id,planned_minutes FROM study_blocks WHERE plan_id=$1 AND status='pending' ORDER BY position",
+                            day["current_plan_id"],
+                        )
+                        if plan
+                        else []
+                    )
+                    content = plan["content"] if plan else None
+                    if isinstance(content, str):
+                        content = json.loads(content)
+                    progress = await conn.fetch(
+                        "SELECT topic_id FROM topic_progress WHERE completed=true"
+                    )
+                    completed = {row["topic_id"] for row in progress}
+                    from app.planning import render_queue
+
+                    actual_today = await conn.fetchval(
+                        "SELECT COALESCE(sum(actual_minutes),0) FROM study_sessions WHERE study_date=$1",
+                        study_date,
+                    )
+                    display_lines = (
+                        render_queue(
+                            rows,
+                            content,
+                            completed,
+                            max(0, day["budget_minutes"] - actual_today),
+                        )
+                        if content
+                        else None
+                    )
+                    if display_lines is not None:
+                        await conn.execute(
+                            "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code','PLAN_READY','plan_id',$2::text)) WHERE operation_id=$1",
+                            operation_id,
+                            str(day["current_plan_id"]),
+                        )
+                        await conn.execute(
+                            "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'today',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                            uuid.uuid4(),
+                            f"operation:{operation_id}:today",
+                            operation_id,
+                            "\n".join(display_lines),
+                        )
+                    else:
+                        await conn.execute(
+                            "UPDATE study_days SET state='replan_required' WHERE study_date=$1",
+                            study_date,
+                        )
+                        day = dict(day)
+                        day["state"] = "replan_required"
+                if day["state"] != "valid":
+                    active_job = await conn.fetchrow(
+                        "SELECT job_id FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running')",
+                        study_date,
+                    )
+                    if active_job is not None:
+                        await conn.execute(
+                            "INSERT INTO planning_job_operations(operation_id,job_id) VALUES($1,$2)",
+                            operation_id,
+                            active_job["job_id"],
+                        )
+                    else:
+                        generation = day["requested_generation"] + 1
+                        await conn.execute(
+                            "UPDATE study_days SET requested_generation=$2 WHERE study_date=$1",
+                            study_date,
+                            generation,
+                        )
+                        job_id = uuid.uuid4()
+                        await conn.execute(
+                            "INSERT INTO planning_jobs(job_id,operation_id,study_date,generation) VALUES($1,$2,$3,$4)",
+                            job_id,
+                            operation_id,
+                            study_date,
+                            generation,
+                        )
+                        await conn.execute(
+                            "INSERT INTO planning_job_operations(operation_id,job_id) VALUES($1,$2)",
+                            operation_id,
+                            job_id,
+                        )
         await conn.execute(
             "UPDATE telegram_cursor SET next_offset=$2, lease_until=now()+interval '60 seconds' WHERE bot_id=$1",
             configured_bot,

@@ -123,7 +123,9 @@ def test_shared_help_explains_confirmation_and_topic_selection():
 def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
     headers = {"Authorization": "Bearer bot-secret"}
     fence = poller(client)
-    future_commands = [name for name, _, _ in COMMANDS if name != "help"]
+    future_commands = [
+        name for name, _, _ in COMMANDS if name not in ("help", "today", "replan")
+    ]
 
     for command in future_commands:
         body = update(next_update_id(), command=command)
@@ -140,16 +142,42 @@ def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
     assert unsupported.status_code == 200
     assert unsupported.json()["result"]["code"] == "UNSUPPORTED_COMMAND"
 
+    today_body = update(next_update_id(), command="today")
+    today_body["poller_fence"] = fence
+    accepted_today = client.post(
+        "/v1/telegram/updates", json=today_body, headers=headers
+    )
+    assert accepted_today.status_code == 200
+    assert accepted_today.json()["status"] == "accepted"
+    assert accepted_today.json()["result"]["code"] == "PLAN_ACCEPTED"
+
+    replan_body = update(next_update_id(), command="replan")
+    replan_body["poller_fence"] = fence
+    accepted_replan = client.post(
+        "/v1/telegram/updates", json=replan_body, headers=headers
+    )
+    assert accepted_replan.status_code == 200
+    assert accepted_replan.json()["status"] == "accepted"
+    assert accepted_replan.json()["result"]["code"] == "PLAN_ACCEPTED"
+
     async def persisted():
         conn = await asyncpg.connect(os.environ["DATABASE_URL"])
         try:
-            return await conn.fetchval(
-                "SELECT count(*) FROM operations"
-            ), await conn.fetchval("SELECT count(*) FROM deliveries")
+            return (
+                await conn.fetchval("SELECT count(*) FROM operations"),
+                await conn.fetchval("SELECT count(*) FROM deliveries"),
+                await conn.fetchval("SELECT count(*) FROM planning_jobs"),
+                await conn.fetchval(
+                    "SELECT count(*) FROM planning_jobs WHERE status='completed'"
+                ),
+                await conn.fetchval(
+                    "SELECT count(*) FROM planning_jobs WHERE status='pending'"
+                ),
+            )
         finally:
             await conn.close()
 
-    assert asyncio.run(persisted()) == (len(future_commands) + 1, 0)
+    assert asyncio.run(persisted()) == (len(future_commands) + 3, 1, 2, 1, 1)
 
 
 def test_update_id_with_different_content_conflicts(client):

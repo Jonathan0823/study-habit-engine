@@ -2,10 +2,13 @@ CREATE TABLE IF NOT EXISTS operations (
     operation_id uuid PRIMARY KEY,
     source_key text UNIQUE NOT NULL,
     request_hash text NOT NULL,
-    status text NOT NULL CHECK (status IN ('accepted', 'rejected')),
+    status text NOT NULL CHECK (status IN ('accepted', 'rejected', 'completed')),
     result jsonb NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE operations DROP CONSTRAINT IF EXISTS operations_status_check;
+ALTER TABLE operations ADD CONSTRAINT operations_status_check
+    CHECK (status IN ('accepted', 'rejected', 'completed'));
 
 CREATE TABLE IF NOT EXISTS telegram_ingestion (
     bot_id bigint NOT NULL,
@@ -82,6 +85,86 @@ CREATE TABLE IF NOT EXISTS admin_idempotency_operations (
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (actor_hash, idempotency_key)
 );
+
+CREATE TABLE IF NOT EXISTS study_days (
+    study_date date PRIMARY KEY,
+    budget_minutes integer NOT NULL DEFAULT 60 CHECK (budget_minutes BETWEEN 0 AND 90),
+    queue_revision bigint NOT NULL DEFAULT 0,
+    state text NOT NULL DEFAULT 'absent' CHECK (state IN ('absent','valid','replan_required')),
+    current_plan_id uuid,
+    requested_generation bigint NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS topic_progress (
+    topic_id text PRIMARY KEY,
+    completed boolean NOT NULL DEFAULT false,
+    study_minutes integer NOT NULL DEFAULT 0 CHECK (study_minutes >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS study_sessions (
+    session_id uuid PRIMARY KEY,
+    topic_id text NOT NULL,
+    study_date date NOT NULL,
+    actual_minutes integer NOT NULL CHECK (actual_minutes BETWEEN 0 AND 1440)
+);
+
+CREATE TABLE IF NOT EXISTS plans (
+    plan_id uuid PRIMARY KEY,
+    study_date date NOT NULL REFERENCES study_days(study_date),
+    curriculum_id uuid NOT NULL REFERENCES curriculum_versions(curriculum_id),
+    generation bigint NOT NULL,
+    state_revision bigint NOT NULL,
+    queue_revision bigint NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (study_date, generation)
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'study_days_current_plan_id_fkey'
+    ) THEN
+        ALTER TABLE study_days
+            ADD CONSTRAINT study_days_current_plan_id_fkey
+            FOREIGN KEY (current_plan_id) REFERENCES plans(plan_id);
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS study_blocks (
+    block_id uuid PRIMARY KEY,
+    plan_id uuid NOT NULL REFERENCES plans(plan_id),
+    position integer NOT NULL,
+    topic_id text NOT NULL,
+    planned_minutes integer NOT NULL CHECK (planned_minutes BETWEEN 15 AND 45),
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done','skipped','cancelled','expired')),
+    UNIQUE (plan_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS planning_jobs (
+    job_id uuid PRIMARY KEY,
+    operation_id uuid NOT NULL REFERENCES operations(operation_id),
+    study_date date NOT NULL REFERENCES study_days(study_date),
+    generation bigint NOT NULL,
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','expired')),
+    state_revision bigint,
+    curriculum_id uuid,
+    lease_owner uuid,
+    fence bigint NOT NULL DEFAULT 0,
+    lease_until timestamptz,
+    result jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (operation_id)
+);
+CREATE INDEX IF NOT EXISTS planning_jobs_ready ON planning_jobs(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS planning_jobs_one_active_per_day
+    ON planning_jobs(study_date) WHERE status IN ('pending','running');
+
+CREATE TABLE IF NOT EXISTS planning_job_operations (
+    operation_id uuid PRIMARY KEY REFERENCES operations(operation_id),
+    job_id uuid NOT NULL REFERENCES planning_jobs(job_id),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS planning_job_operations_job ON planning_job_operations(job_id);
 
 CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id uuid PRIMARY KEY,
