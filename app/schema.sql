@@ -62,9 +62,13 @@ CREATE TABLE IF NOT EXISTS curriculum_previews (
     content_hash text NOT NULL,
     state_revision bigint NOT NULL,
     progress_revision bigint NOT NULL,
+    queue_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
+    mapping jsonb NOT NULL DEFAULT '[]'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     consumed_at timestamptz
 );
+ALTER TABLE curriculum_previews ADD COLUMN IF NOT EXISTS queue_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE curriculum_previews ADD COLUMN IF NOT EXISTS mapping jsonb NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE OR REPLACE FUNCTION prevent_curriculum_content_mutation() RETURNS trigger AS $$
 BEGIN
