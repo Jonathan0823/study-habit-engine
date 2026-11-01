@@ -20,6 +20,6 @@ Compose starts PostgreSQL from `docker.io/library/postgres:17-alpine`, runs the 
 
 ## Verify
 
-`./scripts/test-e2e.sh` uses `uv` for Python dependency and test management, starts a disposable PostgreSQL/API stack, tests persistence and rejection behavior, and runs a Rust simulated-update -> API -> outbox -> delivery-result integration test. It requires Podman with Compose support, `uv`, Cargo, and network access for initial dependency/image downloads.
+`./scripts/test-e2e.sh` uses `uv` for Python dependency and test management, starts a disposable PostgreSQL/API stack, tests persistence and rejection behavior, and runs a Rust simulated-update -> API -> outbox -> delivery-result integration test. It requires a reachable Docker or Podman engine with Compose support, `uv`, Cargo, and network access for initial dependency/image downloads. It prefers a reachable Docker engine, then falls back to a usable Podman Compose runtime.
 
 The operator curriculum client uses the authenticated admin API (no direct database access): set `ADMIN_API_URL` and `ADMIN_SERVICE_TOKEN`, then run `uv run python scripts/curriculum.py curriculum import curriculum.json`, `validate VERSION`, `preview VERSION`, and `activate CONFIRMATION_TOKEN`. Review the hash and impact shown by preview before activation.
