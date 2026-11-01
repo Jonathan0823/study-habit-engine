@@ -53,5 +53,7 @@ def test_budget_mutation_locks_jobs_before_day_update():
     conn = RecordingConnection()
     asyncio.run(lock_replan_state(conn, "2026-11-01", budget_value=45))
     assert "planning_jobs" in conn.statements[0] and "FOR UPDATE" in conn.statements[0]
-    assert "study_days" in conn.statements[1] and "FOR UPDATE" in conn.statements[1]
-    assert "UPDATE study_days SET budget_minutes" in conn.statements[2]
+    assert "engine_state" in conn.statements[1] and "FOR UPDATE" in conn.statements[1]
+    assert "INSERT INTO study_days" in conn.statements[2]
+    assert "study_days" in conn.statements[3] and "FOR UPDATE" in conn.statements[3]
+    assert "UPDATE study_days SET budget_minutes" in conn.statements[4]

@@ -155,6 +155,14 @@ def test_shared_help_explains_confirmation_and_topic_selection():
     )
 
 
+def test_help_and_ingestion_share_progress_command(client):
+    assert any(command[0] == "progress" for command in COMMANDS)
+    assert (
+        "/progress [YYYY-MM-DD | add TOPIC MINUTES [YYYY-MM-DD] | edit SESSION_ID YYYY-MM-DD MINUTES | reopen TOPIC_ID | confirm TOKEN]"
+        in help_text()
+    )
+
+
 def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
     headers = {"Authorization": "Bearer bot-secret"}
     fence = poller(client)
@@ -162,7 +170,16 @@ def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
         name
         for name, _, _ in COMMANDS
         if name
-        not in ("help", "today", "replan", "budget", "done", "skip", "complete_topic")
+        not in (
+            "help",
+            "today",
+            "replan",
+            "budget",
+            "done",
+            "skip",
+            "complete_topic",
+            "progress",
+        )
     ]
 
     for command in future_commands:

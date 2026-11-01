@@ -101,6 +101,9 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
             fence,
         )
         today = job["study_date"]
+        state = await conn.fetchrow(
+            "SELECT active_curriculum_id,state_revision FROM engine_state WHERE singleton=true FOR UPDATE"
+        )
         day = await conn.fetchrow(
             "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", today
         )
@@ -122,10 +125,6 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
                 json.dumps({"reason": "PLAN_SUPERSEDED"}),
             )
             return
-        # Obsolete jobs exit without contending on global engine state.
-        state = await conn.fetchrow(
-            "SELECT active_curriculum_id,state_revision FROM engine_state WHERE singleton=true FOR UPDATE"
-        )
         if (
             today != datetime.now(JAKARTA).date()
             or state is None

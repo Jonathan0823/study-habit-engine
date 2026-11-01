@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS action_confirmations (
     actor_id bigint NOT NULL,
     chat_id bigint NOT NULL,
     recovery_epoch uuid NOT NULL,
-    action text NOT NULL CHECK (action IN ('topic_complete','topic_reopen','block_done')),
+    action text NOT NULL CHECK (action IN ('topic_complete','topic_reopen','block_done','progress_add','progress_edit','progress_reopen')),
     target text NOT NULL,
     study_date date NOT NULL,
     state_revision bigint NOT NULL,
@@ -122,8 +122,13 @@ CREATE TABLE IF NOT EXISTS action_confirmations (
     expires_at timestamptz NOT NULL,
     consumed_at timestamptz,
     result_code text,
-    result_text text
+    result_text text,
+    context jsonb NOT NULL DEFAULT '{}'::jsonb
 );
+ALTER TABLE action_confirmations ADD COLUMN IF NOT EXISTS context jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE action_confirmations DROP CONSTRAINT IF EXISTS action_confirmations_action_check;
+ALTER TABLE action_confirmations ADD CONSTRAINT action_confirmations_action_check
+    CHECK (action IN ('topic_complete','topic_reopen','block_done','progress_add','progress_edit','progress_reopen'));
 -- Legacy bigint confirmation epochs are replaced with UUIDs during upgrade;
 -- old tokens cannot match the new engine epoch.
 DO $$
@@ -140,12 +145,43 @@ CREATE TABLE IF NOT EXISTS topic_progress (
     study_minutes integer NOT NULL DEFAULT 0 CHECK (study_minutes >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS topic_progress_audit (
+    audit_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    operation_id uuid NOT NULL REFERENCES operations(operation_id),
+    topic_id text NOT NULL,
+    before_state jsonb NOT NULL,
+    after_state jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE OR REPLACE FUNCTION prevent_topic_progress_audit_mutation() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'topic progress audit history is immutable'; END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS topic_progress_audit_immutable ON topic_progress_audit;
+CREATE TRIGGER topic_progress_audit_immutable BEFORE UPDATE OR DELETE ON topic_progress_audit
+    FOR EACH ROW EXECUTE FUNCTION prevent_topic_progress_audit_mutation();
+
 CREATE TABLE IF NOT EXISTS study_sessions (
     session_id uuid PRIMARY KEY,
     topic_id text NOT NULL,
     study_date date NOT NULL,
     actual_minutes integer NOT NULL CHECK (actual_minutes BETWEEN 0 AND 1440)
 );
+
+CREATE TABLE IF NOT EXISTS study_session_audit (
+    audit_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    operation_id uuid NOT NULL REFERENCES operations(operation_id),
+    session_id uuid NOT NULL,
+    action text NOT NULL CHECK (action IN ('add','correct')),
+    before_state jsonb,
+    after_state jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE OR REPLACE FUNCTION prevent_study_session_audit_mutation() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'study session audit history is immutable'; END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS study_session_audit_immutable ON study_session_audit;
+CREATE TRIGGER study_session_audit_immutable BEFORE UPDATE OR DELETE ON study_session_audit
+    FOR EACH ROW EXECUTE FUNCTION prevent_study_session_audit_mutation();
 
 CREATE TABLE IF NOT EXISTS plans (
     plan_id uuid PRIMARY KEY,

@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -82,6 +84,137 @@ def _command(update_id, command, arguments=None):
             "arguments": arguments or [],
         },
     }
+
+
+def test_today_progress_confirmation_and_planning_worker_do_not_deadlock(client):
+    headers = {"Authorization": "Bearer bot-secret"}
+    today = datetime.now(ZoneInfo("Asia/Jakarta")).date().isoformat()
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_command(91, "progress", ["add", "a", "10", today]),
+    )
+    assert preview.status_code == 200
+
+    async def postgres_race():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        executor = ThreadPoolExecutor(max_workers=2)
+        observer = None
+        try:
+            token_text = await conn.fetchval(
+                "SELECT payload->>'text' FROM deliveries WHERE operation_id=$1",
+                uuid.UUID(preview.json()["operation_id"]),
+            )
+            confirmation = re.search(
+                r"/progress confirm ([A-Za-z0-9_-]{43})", token_text
+            ).group(1)
+            state = await conn.fetchrow(
+                "SELECT state_revision,active_curriculum_id FROM engine_state WHERE singleton=true"
+            )
+            operation_id, job_id = uuid.uuid4(), uuid.uuid4()
+            writer = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+            try:
+                await writer.execute(
+                    "INSERT INTO operations(operation_id,source_key,request_hash,status,result) VALUES($1,$2,$3,'accepted','{}'::jsonb)",
+                    operation_id,
+                    f"ticket16-worker:{job_id}",
+                    str(job_id),
+                )
+                await writer.execute(
+                    "UPDATE study_days SET requested_generation=1,state='replan_required' WHERE study_date=$1",
+                    datetime.now(ZoneInfo("Asia/Jakarta")).date(),
+                )
+                await writer.execute(
+                    "INSERT INTO planning_jobs(job_id,operation_id,study_date,generation,state_revision,curriculum_id,status,lease_until) VALUES($1,$2,$3,1,$4,$5,'running',now()+interval '1 hour')",
+                    job_id,
+                    operation_id,
+                    datetime.now(ZoneInfo("Asia/Jakarta")).date(),
+                    state["state_revision"],
+                    state["active_curriculum_id"],
+                )
+            finally:
+                await writer.close()
+
+            worker_gate = conn.transaction()
+            await worker_gate.start()
+            await conn.fetchrow(
+                "SELECT * FROM planning_jobs WHERE job_id=$1 FOR UPDATE", job_id
+            )
+            await conn.fetchrow(
+                "SELECT * FROM engine_state WHERE singleton=true FOR UPDATE"
+            )
+            worker_pid = await conn.fetchval("SELECT pg_backend_pid()")
+            observer = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+
+            async def wait_for_row(query, description, *args):
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 10
+                while loop.time() < deadline:
+                    row = await observer.fetchrow(query, *args)
+                    if row is not None:
+                        return row
+                    await asyncio.sleep(0.02)
+                raise AssertionError(f"Timed out waiting for {description}")
+
+            def progress():
+                return client.post(
+                    "/v1/telegram/updates",
+                    headers=headers,
+                    json=_command(92, "progress", ["confirm", confirmation]),
+                )
+
+            progress_future = asyncio.get_running_loop().run_in_executor(
+                executor, progress
+            )
+            await wait_for_row(
+                "SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND pid<>$2 LIMIT 1",
+                "progress request to enter its job-lock path",
+                worker_pid,
+                worker_pid,
+            )
+            await asyncio.wait_for(
+                conn.fetchrow(
+                    "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE",
+                    datetime.now(ZoneInfo("Asia/Jakarta")).date(),
+                ),
+                timeout=10,
+            )
+            await worker_gate.commit()
+            progress_result = await asyncio.wait_for(progress_future, timeout=10)
+            await observer.close()
+            return progress_result
+        finally:
+            if observer is not None:
+                await observer.close()
+            await conn.close()
+            executor.shutdown(wait=True)
+
+    progress_result = asyncio.run(postgres_race())
+    assert progress_result.status_code == 200
+    assert progress_result.json()["result"]["code"] == "PROGRESS_RECORDED"
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchrow(
+                    "SELECT requested_generation,state,current_plan_id FROM study_days WHERE study_date=$1",
+                    datetime.now(ZoneInfo("Asia/Jakarta")).date(),
+                ),
+                await conn.fetchval("SELECT count(*) FROM study_sessions"),
+                await conn.fetchval(
+                    "SELECT count(*) FROM planning_jobs WHERE status='running'"
+                ),
+            )
+        finally:
+            await conn.close()
+
+    day, sessions, active_jobs = asyncio.run(persisted())
+    assert day["requested_generation"] == 1
+    assert day["state"] == "replan_required"
+    assert day["current_plan_id"] is None
+    assert sessions == 1
+    assert active_jobs == 1
 
 
 def test_replan_and_budget_requests_coalesce_and_settle_every_waiter(client):

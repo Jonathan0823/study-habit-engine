@@ -112,9 +112,14 @@ async def lock_study_date_requests(conn, study_date) -> None:
 
 
 async def lock_replan_state(conn, study_date, budget_value: int | None = None):
-    """Lock active jobs before the day, matching the worker's job -> day order."""
+    """Lock active jobs, engine state, then the day, matching the worker."""
     old_jobs = await conn.fetch(
         "SELECT * FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE",
+        study_date,
+    )
+    await conn.fetchrow("SELECT * FROM engine_state WHERE singleton=true FOR UPDATE")
+    await conn.execute(
+        "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT DO NOTHING",
         study_date,
     )
     day = await conn.fetchrow(
@@ -159,11 +164,12 @@ async def issue_action_confirmation(
     queue_revision,
     recovery_epoch,
     planned_minutes=None,
+    context=None,
 ):
     token = secrets.token_urlsafe(32)
     await conn.execute(
-        """INSERT INTO action_confirmations(token,actor_id,chat_id,recovery_epoch,action,target,study_date,state_revision,queue_revision,planned_minutes,expires_at)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now()+interval '10 minutes')""",
+        """INSERT INTO action_confirmations(token,actor_id,chat_id,recovery_epoch,action,target,study_date,state_revision,queue_revision,planned_minutes,expires_at,context)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now()+interval '10 minutes',$11::jsonb)""",
         token,
         actor_id,
         chat_id,
@@ -174,6 +180,7 @@ async def issue_action_confirmation(
         state_revision,
         queue_revision,
         planned_minutes,
+        json.dumps(context or {}),
     )
     return token
 
@@ -191,14 +198,19 @@ async def handle_topic_command(
     from app.planning import JAKARTA
 
     today = datetime.now(JAKARTA).date()
+    await lock_study_date_requests(conn, today)
+    await conn.fetch(
+        "SELECT job_id FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE",
+        today,
+    )
+    state = await conn.fetchrow(
+        "SELECT * FROM engine_state WHERE singleton=true FOR UPDATE"
+    )
     await conn.execute(
         "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT DO NOTHING", today
     )
     day = await conn.fetchrow(
         "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", today
-    )
-    state = await conn.fetchrow(
-        "SELECT * FROM engine_state WHERE singleton=true FOR UPDATE"
     )
     enqueue_delivery = True
     if state["active_curriculum_id"] is None:
@@ -370,6 +382,15 @@ async def handle_topic_command(
                     topic_id, topics, completed
                 )
                 await conn.execute(
+                    """INSERT INTO topic_progress_audit(operation_id,topic_id,before_state,after_state)
+                       SELECT $1,topic_id,
+                              jsonb_build_object('completed',completed,'study_minutes',study_minutes),
+                              jsonb_build_object('completed',false,'study_minutes',study_minutes)
+                       FROM topic_progress WHERE topic_id=ANY($2::text[])""",
+                    operation_id,
+                    list(reopened),
+                )
+                await conn.execute(
                     "UPDATE topic_progress SET completed=false WHERE topic_id=ANY($1::text[])",
                     list(reopened),
                 )
@@ -418,6 +439,18 @@ async def handle_topic_command(
                 )
             else:
                 await conn.execute(
+                    """INSERT INTO topic_progress_audit(operation_id,topic_id,before_state,after_state)
+                       SELECT $1,$2,
+                              jsonb_build_object('completed',COALESCE(progress.completed,false),
+                                                 'study_minutes',COALESCE(progress.study_minutes,0)),
+                              jsonb_build_object('completed',true,
+                                                 'study_minutes',COALESCE(progress.study_minutes,0))
+                       FROM (SELECT 1) seed
+                       LEFT JOIN topic_progress progress ON progress.topic_id=$2""",
+                    operation_id,
+                    topic_id,
+                )
+                await conn.execute(
                     "INSERT INTO topic_progress(topic_id,completed) VALUES($1,true) ON CONFLICT(topic_id) DO UPDATE SET completed=true",
                     topic_id,
                 )
@@ -458,6 +491,709 @@ async def handle_topic_command(
         )
 
 
+async def handle_progress_command(conn, operation_id, arguments, actor_id, chat_id):
+    from datetime import date, datetime
+
+    from app.planning import JAKARTA
+
+    today = datetime.now(JAKARTA).date()
+    mode = (
+        arguments[0]
+        if arguments and arguments[0] in {"add", "edit", "reopen", "confirm"}
+        else "review"
+    )
+    token = arguments[1] if mode == "confirm" and len(arguments) == 2 else None
+    confirmation = None
+    if mode != "review":
+        lock_dates = {today}
+        if mode == "confirm" and token is not None:
+            # Inspect the token without a row lock so date advisory locks always
+            # precede confirmation and business-row locks.
+            preview = await conn.fetchrow(
+                "SELECT context FROM action_confirmations WHERE token=$1", token
+            )
+            if preview is not None:
+                context = preview["context"]
+                context = context if isinstance(context, dict) else json.loads(context)
+                if context.get("study_date"):
+                    lock_dates.add(date.fromisoformat(context["study_date"]))
+                if context.get("new_date"):
+                    lock_dates.add(date.fromisoformat(context["new_date"]))
+        elif mode == "add" and len(arguments) in (3, 4):
+            try:
+                lock_dates.add(
+                    date.fromisoformat(
+                        arguments[3] if len(arguments) == 4 else today.isoformat()
+                    )
+                )
+            except ValueError:
+                pass
+        elif mode == "edit" and len(arguments) == 4:
+            try:
+                lock_dates.add(date.fromisoformat(arguments[2]))
+                session_id = uuid.UUID(arguments[1])
+                before = await conn.fetchrow(
+                    "SELECT study_date FROM study_sessions WHERE session_id=$1",
+                    session_id,
+                )
+                if before is not None:
+                    lock_dates.add(before["study_date"])
+            except ValueError:
+                pass
+        for lock_day in sorted(lock_dates):
+            await lock_study_date_requests(conn, lock_day)
+        for lock_day in sorted(lock_dates):
+            await conn.fetch(
+                "SELECT job_id FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE",
+                lock_day,
+            )
+        state = await conn.fetchrow(
+            "SELECT * FROM engine_state WHERE singleton=true FOR UPDATE"
+        )
+        await conn.execute(
+            "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT DO NOTHING",
+            today,
+        )
+        for lock_day in sorted(lock_dates):
+            await conn.fetchrow(
+                "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", lock_day
+            )
+        if token is not None:
+            confirmation = await conn.fetchrow(
+                "SELECT * FROM action_confirmations WHERE token=$1 FOR UPDATE", token
+            )
+    if token is not None:
+        if confirmation and confirmation["consumed_at"] is not None:
+            if (
+                confirmation["actor_id"] != actor_id
+                or confirmation["chat_id"] != chat_id
+                or confirmation["recovery_epoch"] != state["recovery_epoch"]
+            ):
+                text, code = (
+                    "Confirmation is invalid for this user or chat.",
+                    "STALE_ACTION",
+                )
+            else:
+                text, code = confirmation["result_text"], confirmation["result_code"]
+            await conn.execute(
+                "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
+                operation_id,
+                code,
+            )
+            await conn.execute(
+                "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'progress',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                uuid.uuid4(),
+                f"operation:{operation_id}:progress",
+                operation_id,
+                text,
+            )
+            return
+        if confirmation is None or confirmation["action"] not in (
+            "progress_add",
+            "progress_edit",
+            "progress_reopen",
+        ):
+            text, code = (
+                "Confirmation is invalid or expired. Preview the action again.",
+                "STALE_ACTION",
+            )
+        elif (
+            confirmation["actor_id"] != actor_id
+            or confirmation["chat_id"] != chat_id
+            or confirmation["recovery_epoch"] != state["recovery_epoch"]
+            or confirmation["expires_at"] <= await conn.fetchval("SELECT now()")
+            or confirmation["state_revision"] != state["state_revision"]
+        ):
+            text, code = (
+                "Study state changed. Preview the action again.",
+                "STALE_ACTION",
+            )
+        else:
+            mode = confirmation["action"]
+            context = (
+                confirmation["context"]
+                if isinstance(confirmation["context"], dict)
+                else json.loads(confirmation["context"])
+            )
+            target_date = date.fromisoformat(context["study_date"])
+            current_queue_revision = await conn.fetchval(
+                "SELECT COALESCE((SELECT queue_revision FROM study_days WHERE study_date=$1),0)",
+                target_date,
+            )
+            new_queue_revision = current_queue_revision
+            if "new_date" in context:
+                new_queue_revision = await conn.fetchval(
+                    "SELECT COALESCE((SELECT queue_revision FROM study_days WHERE study_date=$1),0)",
+                    date.fromisoformat(context["new_date"]),
+                )
+            if confirmation[
+                "queue_revision"
+            ] != current_queue_revision or new_queue_revision != context.get(
+                "new_queue_revision", new_queue_revision
+            ):
+                text, code = (
+                    "The target day changed. Preview the action again.",
+                    "STALE_ACTION",
+                )
+            elif target_date > today:
+                text, code = "Future dates cannot be recorded.", "INVALID_DATE"
+            elif mode in ("progress_add", "progress_edit"):
+                new_day = date.fromisoformat(context["new_date"])
+                for lock_day in sorted({target_date, new_day}):
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(0,$1::date - DATE '2000-01-01')",
+                        lock_day,
+                    )
+                session_id = uuid.UUID(context["session_id"])
+                before = (
+                    await conn.fetchrow(
+                        "SELECT * FROM study_sessions WHERE session_id=$1 FOR UPDATE",
+                        session_id,
+                    )
+                    if mode == "progress_edit"
+                    else None
+                )
+                if mode == "progress_edit" and (
+                    before is None
+                    or before["topic_id"] != context["topic_id"]
+                    or before["study_date"].isoformat() != context["before_date"]
+                    or before["actual_minutes"] != context["before_minutes"]
+                ):
+                    text, code = (
+                        "This session changed. Review history and preview the correction again.",
+                        "STALE_ACTION",
+                    )
+                else:
+                    new_day = date.fromisoformat(context["new_date"])
+                    prior_total = await conn.fetchval(
+                        "SELECT COALESCE(sum(actual_minutes),0) FROM study_sessions WHERE study_date=$1",
+                        new_day,
+                    )
+                    effective = (
+                        prior_total
+                        - (
+                            before["actual_minutes"]
+                            if before and before["study_date"] == new_day
+                            else 0
+                        )
+                        + context["minutes"]
+                    )
+                    if effective > 1440:
+                        text, code = (
+                            "The corrected daily total would exceed 1440 minutes.",
+                            "DAILY_LIMIT_EXCEEDED",
+                        )
+                    else:
+                        if before:
+                            await conn.execute(
+                                "UPDATE study_sessions SET study_date=$2,actual_minutes=$3 WHERE session_id=$1",
+                                session_id,
+                                new_day,
+                                context["minutes"],
+                            )
+                        else:
+                            await conn.execute(
+                                "INSERT INTO study_sessions(session_id,topic_id,study_date,actual_minutes) VALUES($1,$2,$3,$4)",
+                                session_id,
+                                context["topic_id"],
+                                new_day,
+                                context["minutes"],
+                            )
+                        after = {
+                            "topic_id": context["topic_id"],
+                            "study_date": new_day.isoformat(),
+                            "actual_minutes": context["minutes"],
+                        }
+                        before_json = (
+                            json.dumps(
+                                {
+                                    "topic_id": before["topic_id"],
+                                    "study_date": before["study_date"].isoformat(),
+                                    "actual_minutes": before["actual_minutes"],
+                                }
+                            )
+                            if before
+                            else None
+                        )
+                        await conn.execute(
+                            "INSERT INTO study_session_audit(operation_id,session_id,action,before_state,after_state) VALUES($1,$2,$3,$4::jsonb,$5::jsonb)",
+                            operation_id,
+                            session_id,
+                            "correct" if before else "add",
+                            before_json,
+                            json.dumps(after),
+                        )
+                        await conn.execute(
+                            "INSERT INTO topic_progress(topic_id,study_minutes) VALUES($1,$2) ON CONFLICT(topic_id) DO UPDATE SET study_minutes=(SELECT COALESCE(sum(actual_minutes),0) FROM study_sessions WHERE topic_id=$1)",
+                            context["topic_id"],
+                            context["minutes"],
+                        )
+                        replan_required = False
+                        if new_day == today or (
+                            before and before["study_date"] == today
+                        ):
+                            await conn.execute(
+                                "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT DO NOTHING",
+                                today,
+                            )
+                            today_row = await conn.fetchrow(
+                                "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE",
+                                today,
+                            )
+                            actual_today = await conn.fetchval(
+                                "SELECT COALESCE(sum(actual_minutes),0) FROM study_sessions WHERE study_date=$1",
+                                today,
+                            )
+                            pending = (
+                                await conn.fetch(
+                                    "SELECT topic_id,planned_minutes FROM study_blocks WHERE plan_id=$1 AND status='pending'",
+                                    today_row["current_plan_id"],
+                                )
+                                if today_row["current_plan_id"] is not None
+                                else []
+                            )
+                            pending_minutes = sum(
+                                row["planned_minutes"] for row in pending
+                            )
+                            completed_today = {
+                                row["topic_id"]
+                                for row in await conn.fetch(
+                                    "SELECT topic_id FROM topic_progress WHERE completed=true"
+                                )
+                            }
+                            current_content = (
+                                await conn.fetchval(
+                                    "SELECT content FROM curriculum_versions WHERE curriculum_id=$1 AND status='approved'",
+                                    state["active_curriculum_id"],
+                                )
+                                if state["active_curriculum_id"]
+                                else None
+                            )
+                            if current_content is not None:
+                                current_content = (
+                                    current_content
+                                    if isinstance(current_content, dict)
+                                    else json.loads(current_content)
+                                )
+                                current_topics = {
+                                    topic["topic_id"]: topic
+                                    for topic in current_content["topics"]
+                                }
+                                handoff_invalid = any(
+                                    block["topic_id"] not in current_topics
+                                    or block["topic_id"] in completed_today
+                                    or not set(
+                                        current_topics[block["topic_id"]][
+                                            "prerequisites"
+                                        ]
+                                    )
+                                    <= completed_today
+                                    for block in pending
+                                )
+                            else:
+                                handoff_invalid = bool(pending)
+                            remaining = max(
+                                0, today_row["budget_minutes"] - actual_today
+                            )
+                            replan_required = (
+                                remaining < pending_minutes or handoff_invalid
+                            )
+                            if replan_required:
+                                await conn.execute(
+                                    "UPDATE study_days SET state='replan_required',queue_revision=queue_revision+1 WHERE study_date=$1",
+                                    today,
+                                )
+                        past_progress_staled_plan = False
+                        if new_day != today:
+                            today_row = await conn.fetchrow(
+                                "SELECT current_plan_id FROM study_days WHERE study_date=$1",
+                                today,
+                            )
+                            if today_row and today_row["current_plan_id"] is not None:
+                                plan_revision = await conn.fetchval(
+                                    "SELECT state_revision FROM plans WHERE plan_id=$1",
+                                    today_row["current_plan_id"],
+                                )
+                                past_progress_staled_plan = (
+                                    plan_revision is not None
+                                    and plan_revision != state["state_revision"] + 1
+                                )
+                                if past_progress_staled_plan and not replan_required:
+                                    await conn.execute(
+                                        "UPDATE study_days SET state='replan_required',queue_revision=queue_revision+1 WHERE study_date=$1",
+                                        today,
+                                    )
+                                    replan_required = True
+                        await conn.execute(
+                            "UPDATE engine_state SET state_revision=state_revision+1,progress_revision=progress_revision+1 WHERE singleton=true"
+                        )
+                        if replan_required and past_progress_staled_plan:
+                            text, code = (
+                                f"Recorded session {session_id} for {new_day}: {context['minutes']} minutes. Today's plan is stale because historical progress changed; queue history is preserved. Use /replan to refresh it.",
+                                "REPLAN_REQUIRED",
+                            )
+                        elif replan_required:
+                            text, code = (
+                                f"Recorded session {session_id} for {new_day}: {context['minutes']} minutes. Today's remaining capacity is below the pending queue or the queue no longer satisfies topic prerequisites; queue history is preserved. Use /replan to refresh it.",
+                                "REPLAN_REQUIRED",
+                            )
+                        else:
+                            text, code = (
+                                f"Recorded session {session_id} for {new_day}: {context['minutes']} minutes.",
+                                "PROGRESS_RECORDED",
+                            )
+            else:
+                topic_id = confirmation["target"]
+                current = (
+                    await conn.fetchrow(
+                        "SELECT content FROM curriculum_versions WHERE curriculum_id=$1 AND status='approved'",
+                        state["active_curriculum_id"],
+                    )
+                    if state["active_curriculum_id"]
+                    else None
+                )
+                if current is None:
+                    text, code = (
+                        "There is no active curriculum.",
+                        "NO_ACTIVE_CURRICULUM",
+                    )
+                else:
+                    content = (
+                        current["content"]
+                        if isinstance(current["content"], dict)
+                        else json.loads(current["content"])
+                    )
+                    topics = {t["topic_id"]: t for t in content["topics"]}
+                    completed = {
+                        r["topic_id"]
+                        for r in await conn.fetch(
+                            "SELECT topic_id FROM topic_progress WHERE completed=true"
+                        )
+                    }
+                    if topic_id not in topics or topic_id not in completed:
+                        text, code = (
+                            "Topic state changed. Preview again.",
+                            "STALE_ACTION",
+                        )
+                    else:
+                        reopened = {topic_id} | completed_dependents(
+                            topic_id, topics, completed
+                        )
+                        await conn.execute(
+                            """INSERT INTO topic_progress_audit(operation_id,topic_id,before_state,after_state)
+                               SELECT $1,topic_id,
+                                      jsonb_build_object('completed',completed,'study_minutes',study_minutes),
+                                      jsonb_build_object('completed',false,'study_minutes',study_minutes)
+                               FROM topic_progress WHERE topic_id=ANY($2::text[])""",
+                            operation_id,
+                            list(reopened),
+                        )
+                        await conn.execute(
+                            "UPDATE topic_progress SET completed=false WHERE topic_id=ANY($1::text[])",
+                            list(reopened),
+                        )
+                        await conn.execute(
+                            "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT DO NOTHING",
+                            today,
+                        )
+                        day = await conn.fetchrow(
+                            "SELECT * FROM study_days WHERE study_date=$1",
+                            today,
+                        )
+                        pending = (
+                            await conn.fetch(
+                                "SELECT block_id,topic_id FROM study_blocks WHERE plan_id=$1 AND status='pending'",
+                                day["current_plan_id"],
+                            )
+                            if day["current_plan_id"] is not None
+                            else []
+                        )
+                        completed_after = completed - reopened
+                        invalid_topics = {
+                            block["topic_id"]
+                            for block in pending
+                            if block["topic_id"] not in topics
+                            or block["topic_id"] in completed_after
+                            or not set(topics[block["topic_id"]]["prerequisites"])
+                            <= completed_after
+                        }
+                        if invalid_topics:
+                            await conn.execute(
+                                "UPDATE study_blocks SET status='cancelled' WHERE plan_id=$1 AND status='pending' AND topic_id=ANY($2::text[])",
+                                day["current_plan_id"],
+                                list(invalid_topics),
+                            )
+                        await conn.execute(
+                            "UPDATE study_days SET state=CASE WHEN $2 THEN 'replan_required' ELSE state END,queue_revision=queue_revision+1 WHERE study_date=$1",
+                            today,
+                            bool(invalid_topics),
+                        )
+                        await conn.execute(
+                            "UPDATE engine_state SET state_revision=state_revision+1,progress_revision=progress_revision+1 WHERE singleton=true"
+                        )
+                        text, code = (
+                            f"Reopened {', '.join(sorted(reopened))}. Recorded study time and history were preserved; use /replan to refresh the queue if needed.",
+                            "TOPICS_REOPENED",
+                        )
+        if confirmation is not None:
+            await conn.execute(
+                "UPDATE action_confirmations SET consumed_at=now(),result_code=$2,result_text=$3 WHERE token=$1 AND consumed_at IS NULL AND actor_id=$4 AND chat_id=$5 AND recovery_epoch=$6",
+                token,
+                code,
+                text,
+                actor_id,
+                chat_id,
+                state["recovery_epoch"],
+            )
+    elif mode == "review":
+        supplied = arguments[0] if arguments else None
+        try:
+            study_date = date.fromisoformat(supplied) if supplied else today
+            if supplied and study_date.isoformat() != supplied:
+                raise ValueError
+        except ValueError:
+            study_date = None
+        if study_date is None or study_date > today:
+            text, code = (
+                "Use /progress [YYYY-MM-DD] with a date no later than today in Asia/Jakarta.",
+                "INVALID_DATE",
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT session_id,topic_id,actual_minutes FROM study_sessions WHERE study_date=$1 ORDER BY session_id",
+                study_date,
+            )
+            total = sum(r["actual_minutes"] for r in rows)
+            details = (
+                "; ".join(
+                    f"{r['session_id']} {r['topic_id']} {r['actual_minutes']}m"
+                    for r in rows
+                )
+                or "no sessions"
+            )
+            text, code = (
+                f"Progress for {study_date}: {total}/1440 minutes; {details}. Add: /progress add TOPIC MINUTES [YYYY-MM-DD].",
+                "PROGRESS_HISTORY",
+            )
+    elif mode == "add" and len(arguments) in (3, 4):
+        topic_id, raw_minutes = arguments[1:3]
+        supplied = arguments[3] if len(arguments) == 4 else today.isoformat()
+        minutes, minutes_error = parse_actual_minutes([raw_minutes])
+        try:
+            study_date = date.fromisoformat(supplied)
+            if study_date.isoformat() != supplied:
+                raise ValueError
+        except ValueError:
+            study_date = None
+        known = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM curriculum_versions v, jsonb_array_elements(v.content->'topics') t WHERE t->>'topic_id'=$1)",
+            topic_id,
+        )
+        if study_date is None or study_date > today:
+            text, code = (
+                "Historical progress requires a valid date no later than today in Asia/Jakarta.",
+                "INVALID_DATE",
+            )
+        elif minutes_error:
+            text, code = (
+                "Minutes must be a whole number from 0 to 1440.",
+                minutes_error,
+            )
+        elif not known:
+            text, code = (
+                "Unknown topic. Use a topic identity from the curriculum.",
+                "UNKNOWN_TOPIC",
+            )
+        else:
+            total = await conn.fetchval(
+                "SELECT COALESCE(sum(actual_minutes),0) FROM study_sessions WHERE study_date=$1",
+                study_date,
+            )
+            if total + minutes > 1440:
+                text, code = (
+                    "The daily total would exceed 1440 minutes.",
+                    "DAILY_LIMIT_EXCEEDED",
+                )
+            else:
+                session_id = uuid.uuid4()
+                queue_revision = await conn.fetchval(
+                    "SELECT COALESCE((SELECT queue_revision FROM study_days WHERE study_date=$1),0)",
+                    study_date,
+                )
+                token = await issue_action_confirmation(
+                    conn,
+                    actor_id,
+                    chat_id,
+                    "progress_add",
+                    session_id,
+                    study_date,
+                    state["state_revision"],
+                    queue_revision,
+                    state["recovery_epoch"],
+                    context={
+                        "session_id": str(session_id),
+                        "topic_id": topic_id,
+                        "study_date": study_date.isoformat(),
+                        "new_date": study_date.isoformat(),
+                        "minutes": minutes,
+                    },
+                )
+                text, code = (
+                    f"Add {minutes} minutes for {topic_id} on {study_date}? Confirm with /progress confirm {token}.",
+                    "PROGRESS_CONFIRMATION_REQUIRED",
+                )
+    elif mode == "edit" and len(arguments) == 4:
+        minutes, minutes_error = parse_actual_minutes([arguments[3]])
+        try:
+            session_id = uuid.UUID(arguments[1])
+            new_date = date.fromisoformat(arguments[2])
+            if new_date.isoformat() != arguments[2]:
+                raise ValueError
+        except ValueError:
+            session_id, new_date = None, None
+        before = (
+            await conn.fetchrow(
+                "SELECT * FROM study_sessions WHERE session_id=$1", session_id
+            )
+            if session_id
+            else None
+        )
+        if new_date is None or new_date > today:
+            text, code = (
+                "Correction date must be valid and no later than today.",
+                "INVALID_DATE",
+            )
+        elif minutes_error:
+            text, code = (
+                "Minutes must be a whole number from 0 to 1440.",
+                minutes_error,
+            )
+        elif before is None:
+            text, code = (
+                "Unknown session. Review /progress for its date.",
+                "UNKNOWN_SESSION",
+            )
+        else:
+            total = await conn.fetchval(
+                "SELECT COALESCE(sum(actual_minutes),0) FROM study_sessions WHERE study_date=$1",
+                new_date,
+            )
+            effective = (
+                total
+                - (before["actual_minutes"] if before["study_date"] == new_date else 0)
+                + minutes
+            )
+            if effective > 1440:
+                text, code = (
+                    "The corrected daily total would exceed 1440 minutes.",
+                    "DAILY_LIMIT_EXCEEDED",
+                )
+            else:
+                queue_revision = await conn.fetchval(
+                    "SELECT COALESCE((SELECT queue_revision FROM study_days WHERE study_date=$1),0)",
+                    before["study_date"],
+                )
+                new_queue_revision = await conn.fetchval(
+                    "SELECT COALESCE((SELECT queue_revision FROM study_days WHERE study_date=$1),0)",
+                    new_date,
+                )
+                token = await issue_action_confirmation(
+                    conn,
+                    actor_id,
+                    chat_id,
+                    "progress_edit",
+                    session_id,
+                    before["study_date"],
+                    state["state_revision"],
+                    queue_revision,
+                    state["recovery_epoch"],
+                    context={
+                        "session_id": str(session_id),
+                        "topic_id": before["topic_id"],
+                        "study_date": before["study_date"].isoformat(),
+                        "before_date": before["study_date"].isoformat(),
+                        "before_minutes": before["actual_minutes"],
+                        "new_date": new_date.isoformat(),
+                        "new_queue_revision": new_queue_revision,
+                        "minutes": minutes,
+                    },
+                )
+                text, code = (
+                    f"Correct session {session_id} ({before['study_date']} {before['actual_minutes']}m) to {new_date} {minutes}m? Confirm with /progress confirm {token}.",
+                    "PROGRESS_CONFIRMATION_REQUIRED",
+                )
+    elif mode == "reopen" and len(arguments) == 2:
+        topic_id = arguments[1]
+        if not state["active_curriculum_id"]:
+            text, code = "There is no active curriculum.", "NO_ACTIVE_CURRICULUM"
+        else:
+            curriculum = await conn.fetchrow(
+                "SELECT content FROM curriculum_versions WHERE curriculum_id=$1 AND status='approved'",
+                state["active_curriculum_id"],
+            )
+            content = (
+                curriculum["content"]
+                if isinstance(curriculum["content"], dict)
+                else json.loads(curriculum["content"])
+            )
+            topics = {t["topic_id"]: t for t in content["topics"]}
+            completed = {
+                r["topic_id"]
+                for r in await conn.fetch(
+                    "SELECT topic_id FROM topic_progress WHERE completed=true"
+                )
+            }
+            if topic_id not in topics or topic_id not in completed:
+                text, code = (
+                    "Topic is not a completed topic in the active curriculum.",
+                    "UNKNOWN_TOPIC",
+                )
+            else:
+                reopened = {topic_id} | completed_dependents(
+                    topic_id, topics, completed
+                )
+                queue_revision = await conn.fetchval(
+                    "SELECT COALESCE((SELECT queue_revision FROM study_days WHERE study_date=$1),0)",
+                    today,
+                )
+                token = await issue_action_confirmation(
+                    conn,
+                    actor_id,
+                    chat_id,
+                    "progress_reopen",
+                    topic_id,
+                    today,
+                    state["state_revision"],
+                    queue_revision,
+                    state["recovery_epoch"],
+                    context={
+                        "topics": sorted(reopened),
+                        "study_date": today.isoformat(),
+                    },
+                )
+                text, code = (
+                    f"Reopen {topic_id} and completed dependents {', '.join(sorted(reopened - {topic_id})) or 'none'}? Study time is preserved. Confirm with /progress confirm {token}.",
+                    "PROGRESS_CONFIRMATION_REQUIRED",
+                )
+    else:
+        text, code = (
+            "Use /progress [YYYY-MM-DD], /progress add TOPIC MINUTES [DATE], /progress edit SESSION_ID DATE MINUTES, or /progress reopen TOPIC_ID.",
+            "INVALID_ARGUMENTS",
+        )
+    await conn.execute(
+        "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
+        operation_id,
+        code,
+    )
+    await conn.execute(
+        "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'progress',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+        uuid.uuid4(),
+        f"operation:{operation_id}:progress",
+        operation_id,
+        text,
+    )
+
+
 async def handle_block_command(
     conn,
     operation_id,
@@ -472,20 +1208,21 @@ async def handle_block_command(
     from app.planning import JAKARTA
 
     today = datetime.now(JAKARTA).date()
-    await conn.execute(
-        "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT(study_date) DO NOTHING",
-        today,
-    )
-    # Match the planner's job -> day -> engine-state lock order.
+    await lock_study_date_requests(conn, today)
+    # Match the planner's advisory -> job -> engine-state -> day lock order.
     await conn.fetch(
         "SELECT job_id FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE",
         today,
     )
-    day = await conn.fetchrow(
-        "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", today
-    )
     await conn.fetchrow(
         "SELECT state_revision FROM engine_state WHERE singleton=true FOR UPDATE"
+    )
+    await conn.execute(
+        "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT(study_date) DO NOTHING",
+        today,
+    )
+    day = await conn.fetchrow(
+        "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", today
     )
     blocks = (
         await conn.fetch(
@@ -904,6 +1641,7 @@ async def ingest(body: Update):
             "done",
             "skip",
             "complete_topic",
+            "progress",
         )
         budget_value, budget_error = (
             parse_budget(body.payload.arguments)
@@ -979,6 +1717,10 @@ async def ingest(body: Update):
             await handle_topic_command(
                 conn, operation_id, body.payload.arguments, actor_id, chat_id
             )
+        elif status == "accepted" and body.payload.command == "progress":
+            await handle_progress_command(
+                conn, operation_id, body.payload.arguments, actor_id, chat_id
+            )
         elif status == "accepted" and body.payload.command in ("done", "skip"):
             await handle_block_command(
                 conn,
@@ -1007,13 +1749,9 @@ async def ingest(body: Update):
 
             study_date = datetime.now(JAKARTA).date()
             await lock_study_date_requests(conn, study_date)
-            await conn.execute(
-                "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT(study_date) DO NOTHING",
-                study_date,
-            )
             # Keep all waiting operations attached to the newest generation. Locks
-            # follow the worker's job -> day order, so a worker either commits before
-            # this request or observes that its job was retired before doing work.
+            # follow the worker's job -> engine-state -> day order, so a worker either
+            # commits before this request or observes that its job was retired.
             old_jobs, day = await lock_replan_state(
                 conn,
                 study_date,

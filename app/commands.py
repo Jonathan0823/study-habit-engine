@@ -20,8 +20,8 @@ COMMANDS = (
     ("replan", "", "Request a replacement for today's unfinished queue"),
     (
         "progress",
-        "[YYYY-MM-DD]",
-        "Browse history (today by default) and select a correction action",
+        "[YYYY-MM-DD | add TOPIC MINUTES [YYYY-MM-DD] | edit SESSION_ID YYYY-MM-DD MINUTES | reopen TOPIC_ID | confirm TOKEN]",
+        "Review history, record or correct sessions, or reopen a topic with confirmation",
     ),
 )
 
