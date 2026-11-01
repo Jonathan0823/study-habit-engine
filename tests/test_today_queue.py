@@ -528,6 +528,99 @@ def test_no_plan_reason_distinguishes_capacity_from_eligibility(
         assert "No eligible study topics" in text
 
 
+def test_replan_does_not_refill_a_topic_skipped_from_todays_queue(today_client):
+    async def setup():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO telegram_cursor(bot_id,next_offset,poller_owner,fence,lease_until) VALUES(12345,0,$1,1,now()+interval '1 minute')",
+                uuid.uuid4(),
+            )
+            topics = [
+                {
+                    "topic_id": topic_id,
+                    "title": topic_id,
+                    "description": topic_id,
+                    "estimate_minutes": 60,
+                    "position": position,
+                    "prerequisites": [],
+                    "resources": [],
+                }
+                for position, topic_id in enumerate(
+                    ("skipped-topic", "available-topic")
+                )
+            ]
+            curriculum_id = uuid.uuid4()
+            await conn.execute(
+                "INSERT INTO curriculum_versions(curriculum_id,status,content_hash,content) VALUES($1,'approved',$2,$3::jsonb)",
+                curriculum_id,
+                f"test-{curriculum_id}",
+                json.dumps({"topics": topics}),
+            )
+            await conn.execute(
+                "UPDATE engine_state SET active_curriculum_id=$1 WHERE singleton=true",
+                curriculum_id,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup())
+    headers = {"Authorization": "Bearer bot-secret"}
+    first = today_client.post(
+        "/v1/telegram/updates", headers=headers, json=_today_payload(900000001)
+    )
+    assert first.status_code == 200
+
+    async def create_initial_plan():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            async with pool.acquire() as conn:
+                job_id = await conn.fetchval("SELECT job_id FROM planning_jobs")
+            await process_job(pool, job_id, uuid.uuid4())
+            async with pool.acquire() as conn, conn.transaction():
+                plan_id = await conn.fetchval(
+                    "SELECT current_plan_id FROM study_days WHERE study_date=(now() AT TIME ZONE 'Asia/Jakarta')::date"
+                )
+                skipped_block = await conn.fetchval(
+                    "SELECT block_id FROM study_blocks WHERE plan_id=$1 AND topic_id='skipped-topic' LIMIT 1",
+                    plan_id,
+                )
+                assert skipped_block is not None
+                await conn.execute(
+                    "UPDATE study_blocks SET status='skipped' WHERE block_id=$1",
+                    skipped_block,
+                )
+        finally:
+            await pool.close()
+
+    asyncio.run(create_initial_plan())
+    replan_payload = _today_payload(900000002)
+    replan_payload["payload"]["command"] = "replan"
+    replanned = today_client.post(
+        "/v1/telegram/updates", headers=headers, json=replan_payload
+    )
+    assert replanned.status_code == 200
+
+    async def run_replan_worker():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            async with pool.acquire() as conn:
+                job_id = await conn.fetchval(
+                    "SELECT job_id FROM planning_jobs WHERE status='pending'"
+                )
+            await process_job(pool, job_id, uuid.uuid4())
+            async with pool.acquire() as conn:
+                return await conn.fetch(
+                    "SELECT b.topic_id FROM study_blocks b JOIN study_days d ON d.current_plan_id=b.plan_id ORDER BY b.position"
+                )
+        finally:
+            await pool.close()
+
+    blocks = asyncio.run(run_replan_worker())
+    assert blocks
+    assert {block["topic_id"] for block in blocks} == {"available-topic"}
+
+
 def test_today_worker_commits_only_eligible_queue_and_outbox(today_client):
     async def run():
         conn = await asyncpg.connect(os.environ["DATABASE_URL"])

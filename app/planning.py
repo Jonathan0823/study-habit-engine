@@ -26,13 +26,19 @@ class Candidate(TypedDict):
     started_minutes: int
 
 
-def allocate(candidates: list[Candidate], capacity: int) -> list[dict]:
+def allocate(
+    candidates: list[Candidate],
+    capacity: int,
+    skipped_topic_ids: set[str] | None = None,
+) -> list[dict]:
     """Allocate 30-minute blocks in repeated passes; never create work or filler."""
     capacity = max(0, min(90, capacity))
+    skipped_topic_ids = skipped_topic_ids or set()
     eligible = [
         item
         for item in candidates
-        if set(item["prerequisites"]) <= set(item["completed_prerequisites"])
+        if item["topic_id"] not in skipped_topic_ids
+        and set(item["prerequisites"]) <= set(item["completed_prerequisites"])
     ]
     eligible.sort(
         key=lambda item: (
@@ -131,6 +137,7 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
                 "NO_APPROVED_CURRICULUM"
                 if state is None or state["active_curriculum_id"] is None
                 else "PLAN_EXPIRED",
+                day,
             )
             return
         curriculum = await conn.fetchrow(
@@ -138,7 +145,7 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
             state["active_curriculum_id"],
         )
         if curriculum is None or curriculum["status"] != "approved":
-            await _no_plan(conn, job, "NO_APPROVED_CURRICULUM")
+            await _no_plan(conn, job, "NO_APPROVED_CURRICULUM", day)
             return
         content = curriculum["content"]
         if isinstance(content, str):
@@ -165,6 +172,11 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
             "SELECT topic_id FROM topic_progress WHERE completed=true"
         )
         completed = {r["topic_id"] for r in completed_rows}
+        skipped_rows = await conn.fetch(
+            "SELECT DISTINCT b.topic_id FROM study_blocks b JOIN plans p USING(plan_id) WHERE p.study_date=$1 AND b.status='skipped'",
+            today,
+        )
+        skipped_topic_ids = {r["topic_id"] for r in skipped_rows}
         candidates = [
             {
                 "topic_id": t["topic_id"],
@@ -177,14 +189,26 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
             for t in content["topics"]
             if t["topic_id"] not in completed
         ]
-        blocks = allocate(candidates, min(day["budget_minutes"], 90) - actual)
+        blocks = allocate(
+            candidates,
+            min(day["budget_minutes"], 90) - actual,
+            skipped_topic_ids,
+        )
         if not blocks:
             eligible = any(
-                t["topic_id"] not in completed and set(t["prerequisites"]) <= completed
+                t["topic_id"] not in completed
+                and t["topic_id"] not in skipped_topic_ids
+                and set(t["prerequisites"]) <= completed
                 for t in content["topics"]
             )
-            reason = "NO_BLOCK_FITS" if eligible else "NO_ELIGIBLE_TOPICS"
-            await _no_plan(conn, job, reason)
+            reason = (
+                "REST_DAY"
+                if day["budget_minutes"] == 0
+                else "NO_BLOCK_FITS"
+                if eligible
+                else "NO_ELIGIBLE_TOPICS"
+            )
+            await _no_plan(conn, job, reason, day)
             return
         plan_id = uuid.uuid4()
         queue_rev = day["queue_revision"] + 1
@@ -209,6 +233,12 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
         lines = render_queue(
             blocks, content, completed, min(day["budget_minutes"], 90) - actual
         )
+        previous_plan_id = day["current_plan_id"]
+        if previous_plan_id is not None:
+            await conn.execute(
+                "UPDATE study_blocks SET status='cancelled' WHERE plan_id=$1 AND status='pending'",
+                previous_plan_id,
+            )
         await conn.execute(
             "UPDATE study_days SET current_plan_id=$2,queue_revision=$3,state='valid' WHERE study_date=$1",
             today,
@@ -251,11 +281,23 @@ async def _deliver(conn, operation_id: uuid.UUID, text: str) -> None:
     )
 
 
-async def _no_plan(conn, job, reason: str) -> None:
+async def _no_plan(conn, job, reason: str, day) -> None:
+    previous_plan_id = day["current_plan_id"]
+    if previous_plan_id is not None:
+        await conn.execute(
+            "UPDATE study_blocks SET status='cancelled' WHERE plan_id=$1 AND status='pending'",
+            previous_plan_id,
+        )
+    await conn.execute(
+        "UPDATE study_days SET current_plan_id=NULL,queue_revision=$2,state='absent' WHERE study_date=$1",
+        day["study_date"],
+        day["queue_revision"] + 1,
+    )
     text = {
         "NO_APPROVED_CURRICULUM": "No approved curriculum is available, so I can't make a queue.",
         "PLAN_EXPIRED": "That request expired; request /today for the current day.",
         "NO_ELIGIBLE_TOPICS": "No eligible study topics are available right now.",
+        "REST_DAY": "Today's budget is 0 minutes, so this is a rest day.",
         "NO_BLOCK_FITS": "Eligible topics exist, but no study block fits the available time (minimum 15 minutes).",
     }.get(reason, "No study block fits the available time (minimum 15 minutes).")
     operation_ids = await _job_operations(conn, job)

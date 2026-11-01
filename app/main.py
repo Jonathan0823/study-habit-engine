@@ -78,6 +78,48 @@ def service_auth(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(401, detail={"code": "UNAUTHORIZED", "retryable": False})
 
 
+def parse_budget(arguments: list[str]) -> tuple[int | None, str | None]:
+    if not arguments:
+        return None, "BUDGET_PROMPT"
+    if (
+        len(arguments) != 1
+        or not arguments[0].isascii()
+        or not arguments[0].isdecimal()
+    ):
+        return None, "INVALID_BUDGET"
+    value = int(arguments[0])
+    return (value, None) if 0 <= value <= 90 else (None, "INVALID_BUDGET")
+
+
+async def lock_study_date_requests(conn, study_date) -> None:
+    """Serialize queue creators without taking day before their job locks."""
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(0,$1::date - DATE '2000-01-01')",
+        study_date,
+    )
+
+
+async def lock_replan_state(conn, study_date, budget_value: int | None = None):
+    """Lock active jobs before the day, matching the worker's job -> day order."""
+    old_jobs = await conn.fetch(
+        "SELECT * FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE",
+        study_date,
+    )
+    day = await conn.fetchrow(
+        "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", study_date
+    )
+    if budget_value is not None:
+        await conn.execute(
+            "UPDATE study_days SET budget_minutes=$2,state='replan_required' WHERE study_date=$1",
+            study_date,
+            budget_value,
+        )
+        await conn.execute(
+            "UPDATE engine_state SET state_revision=state_revision+1 WHERE singleton=true"
+        )
+    return old_jobs, day
+
+
 def fixed_error(status: int, code: str, retryable: bool = False) -> JSONResponse:
     return JSONResponse(
         status_code=status, content={"code": code, "retryable": retryable}
@@ -212,9 +254,23 @@ async def ingest(body: Update):
             and actor_id == chat_id
         )
         defined_command = any(name == body.payload.command for name, _, _ in COMMANDS)
-        implemented_command = body.payload.command in ("help", "today", "replan")
+        implemented_command = body.payload.command in (
+            "help",
+            "today",
+            "replan",
+            "budget",
+        )
+        budget_value, budget_error = (
+            parse_budget(body.payload.arguments)
+            if body.payload.command == "budget"
+            else (None, None)
+        )
         operation_id = uuid.uuid4()
-        status = "accepted" if authorized and implemented_command else "rejected"
+        status = (
+            "accepted"
+            if authorized and implemented_command and budget_error != "INVALID_BUDGET"
+            else "rejected"
+        )
         result_code = (
             "UNAUTHORIZED"
             if not authorized
@@ -222,6 +278,8 @@ async def ingest(body: Update):
             if not defined_command
             else "NOT_IMPLEMENTED"
             if not implemented_command
+            else budget_error
+            if budget_error is not None
             else "HELP_READY"
             if body.payload.command == "help"
             else "PLAN_ACCEPTED"
@@ -256,55 +314,49 @@ async def ingest(body: Update):
                 operation_id,
                 help_text(),
             )
-        elif status == "accepted" and body.payload.command == "replan":
+        elif (
+            status == "accepted"
+            and body.payload.command == "budget"
+            and budget_error == "BUDGET_PROMPT"
+        ):
+            await conn.execute(
+                "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'help',jsonb_build_object('text',$4::text))",
+                uuid.uuid4(),
+                f"operation:{operation_id}:budget-prompt",
+                operation_id,
+                "Send /budget followed by a whole number from 0 to 90 minutes.",
+            )
+        elif status == "accepted" and body.payload.command in ("replan", "budget"):
             from datetime import datetime
 
             from app.planning import JAKARTA
 
             study_date = datetime.now(JAKARTA).date()
+            await lock_study_date_requests(conn, study_date)
             await conn.execute(
                 "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT(study_date) DO NOTHING",
                 study_date,
             )
-            # Lock in the same job -> day order as the worker. Marking any prior
-            # active generation terminal frees the per-day active-job constraint.
-            old_jobs = await conn.fetch(
-                "SELECT * FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE",
+            # Keep all waiting operations attached to the newest generation. Locks
+            # follow the worker's job -> day order, so a worker either commits before
+            # this request or observes that its job was retired before doing work.
+            old_jobs, day = await lock_replan_state(
+                conn,
                 study_date,
+                budget_value if body.payload.command == "budget" else None,
             )
-            day = await conn.fetchrow(
-                "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", study_date
-            )
-            for old_job in old_jobs:
-                old_operations = await conn.fetch(
-                    "SELECT operation_id FROM planning_job_operations WHERE job_id=$1 UNION SELECT $2::uuid",
-                    old_job["job_id"],
-                    old_job["operation_id"],
-                )
-                for old_operation in old_operations:
-                    old_operation_id = old_operation["operation_id"]
-                    await conn.execute(
-                        "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code','PLAN_SUPERSEDED','reason','PLAN_SUPERSEDED')) WHERE operation_id=$1",
-                        old_operation_id,
-                    )
-                    await conn.execute(
-                        "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'today',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
-                        uuid.uuid4(),
-                        f"operation:{old_operation_id}:today",
-                        old_operation_id,
-                        "A newer planning request replaced this one; use /today to see the current queue.",
-                    )
-                await conn.execute(
-                    "UPDATE planning_jobs SET status='completed',result=$2::jsonb,lease_until=NULL WHERE job_id=$1",
-                    old_job["job_id"],
-                    json.dumps({"reason": "PLAN_SUPERSEDED"}),
-                )
             generation = day["requested_generation"] + 1
             await conn.execute(
                 "UPDATE study_days SET requested_generation=$2,state='replan_required' WHERE study_date=$1",
                 study_date,
                 generation,
             )
+            for old_job in old_jobs:
+                await conn.execute(
+                    "UPDATE planning_jobs SET status='completed',result=$2::jsonb,lease_until=NULL WHERE job_id=$1",
+                    old_job["job_id"],
+                    json.dumps({"reason": "COALESCED", "generation": generation}),
+                )
             job_id = uuid.uuid4()
             await conn.execute(
                 "INSERT INTO planning_jobs(job_id,operation_id,study_date,generation) VALUES($1,$2,$3,$4)",
@@ -313,6 +365,12 @@ async def ingest(body: Update):
                 study_date,
                 generation,
             )
+            for old_job in old_jobs:
+                await conn.execute(
+                    "UPDATE planning_job_operations SET job_id=$2 WHERE job_id=$1",
+                    old_job["job_id"],
+                    job_id,
+                )
             await conn.execute(
                 "INSERT INTO planning_job_operations(operation_id,job_id) VALUES($1,$2)",
                 operation_id,
@@ -324,6 +382,7 @@ async def ingest(body: Update):
             from app.planning import JAKARTA
 
             study_date = datetime.now(JAKARTA).date()
+            await lock_study_date_requests(conn, study_date)
             day = await conn.fetchrow(
                 """INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT(study_date)
                    DO UPDATE SET study_date=EXCLUDED.study_date RETURNING *""",
