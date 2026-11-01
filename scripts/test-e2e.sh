@@ -1,12 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-if command -v podman >/dev/null 2>&1; then
-  compose=(podman compose)
-elif command -v docker >/dev/null 2>&1; then
-  compose=(docker compose)
+engine_is_usable() {
+  local engine=$1
+  shift
+  command -v "$engine" >/dev/null 2>&1 || return 1
+  "$engine" info >/dev/null 2>&1 || return 1
+  "$@" version >/dev/null 2>&1 || return 1
+  env \
+    BOT_SERVICE_TOKEN="${BOT_SERVICE_TOKEN:-ci-probe}" \
+    ADMIN_SERVICE_TOKEN="${ADMIN_SERVICE_TOKEN:-ci-probe}" \
+    TELEGRAM_BOT_ID="${TELEGRAM_BOT_ID:-1}" \
+    TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-1}" \
+    TELEGRAM_PRIVATE_CHAT_ID="${TELEGRAM_PRIVATE_CHAT_ID:-1}" \
+    TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-ci-probe}" \
+    "$@" ps >/dev/null 2>&1
+}
+
+compose_project="study-habit-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$"
+if engine_is_usable docker docker compose; then
+  compose=(docker compose --project-name "$compose_project")
+elif engine_is_usable podman podman compose; then
+  compose=(podman compose --project-name "$compose_project")
 else
-  echo "Podman or Docker Compose is required" >&2
+  cat >&2 <<'EOF'
+A reachable Docker or Podman engine with Compose support is required.
+Docker must pass `docker info` and `docker compose version`; Podman must pass
+`podman info` and `podman compose version`. Start/configure an engine and ensure
+its Compose provider is installed, then retry scripts/test-e2e.sh.
+EOF
   exit 1
 fi
 trap '"${compose[@]}" down -v' EXIT
