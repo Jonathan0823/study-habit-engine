@@ -44,6 +44,10 @@ def test_empty_eligibility_and_capacity_are_safe():
     assert allocate([topic("a", 0)], 0) == []
 
 
+def test_negative_capacity_allocates_no_blocks():
+    assert allocate([topic("a", 0)], -1) == []
+
+
 def test_allocator_excludes_topics_skipped_today():
     candidates = [topic("skipped", 0), topic("available", 1)]
     assert allocate(candidates, 60, {"skipped"}) == [

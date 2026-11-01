@@ -3,8 +3,8 @@ COMMANDS = (
     ("today", "", "View today's study queue; create it only when absent"),
     (
         "done",
-        "[block_id] [actual_minutes]",
-        "Record time and close a block after confirmation; choose from pending blocks when omitted",
+        "[block_id] [queue_revision actual_minutes]",
+        "Choose a pending block, then confirm with its current queue revision and actual minutes",
     ),
     (
         "skip",

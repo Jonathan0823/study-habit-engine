@@ -140,6 +140,9 @@ CREATE TABLE IF NOT EXISTS study_blocks (
     UNIQUE (plan_id, position)
 );
 
+ALTER TABLE study_sessions ADD COLUMN IF NOT EXISTS block_id uuid REFERENCES study_blocks(block_id);
+CREATE UNIQUE INDEX IF NOT EXISTS study_sessions_block_id_unique ON study_sessions(block_id) WHERE block_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS planning_jobs (
     job_id uuid PRIMARY KEY,
     operation_id uuid NOT NULL REFERENCES operations(operation_id),

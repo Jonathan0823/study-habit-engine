@@ -78,6 +78,17 @@ def service_auth(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(401, detail={"code": "UNAUTHORIZED", "retryable": False})
 
 
+def parse_actual_minutes(arguments: list[str]) -> tuple[int | None, str | None]:
+    if (
+        len(arguments) != 1
+        or not arguments[0].isascii()
+        or not arguments[0].isdecimal()
+    ):
+        return None, "INVALID_ACTUAL_MINUTES"
+    value = int(arguments[0])
+    return (value, None) if 0 <= value <= 1440 else (None, "INVALID_ACTUAL_MINUTES")
+
+
 def parse_budget(arguments: list[str]) -> tuple[int | None, str | None]:
     if not arguments:
         return None, "BUDGET_PROMPT"
@@ -118,6 +129,180 @@ async def lock_replan_state(conn, study_date, budget_value: int | None = None):
             "UPDATE engine_state SET state_revision=state_revision+1 WHERE singleton=true"
         )
     return old_jobs, day
+
+
+async def handle_block_command(conn, operation_id, command: str, arguments: list[str]):
+    from datetime import datetime
+
+    from app.planning import JAKARTA
+
+    today = datetime.now(JAKARTA).date()
+    await conn.execute(
+        "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT(study_date) DO NOTHING",
+        today,
+    )
+    # Match the planner's job -> day -> engine-state lock order.
+    await conn.fetch(
+        "SELECT job_id FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE",
+        today,
+    )
+    day = await conn.fetchrow(
+        "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", today
+    )
+    await conn.fetchrow(
+        "SELECT state_revision FROM engine_state WHERE singleton=true FOR UPDATE"
+    )
+    blocks = (
+        await conn.fetch(
+            """SELECT b.block_id,b.topic_id,b.planned_minutes,b.position
+           FROM study_blocks b JOIN plans p USING(plan_id)
+           WHERE p.plan_id=$1 AND p.study_date=$2 AND b.status='pending'
+           ORDER BY b.position""",
+            day["current_plan_id"],
+            today,
+        )
+        if day["current_plan_id"] is not None and day["state"] == "valid"
+        else []
+    )
+    target = None
+    if arguments:
+        try:
+            target_id = uuid.UUID(arguments[0])
+        except ValueError:
+            target_id = None
+        target = next(
+            (block for block in blocks if block["block_id"] == target_id), None
+        )
+    if not arguments:
+        if blocks:
+            rows = [
+                f"{i}. {row['topic_id']} — {row['planned_minutes']} min (block {row['block_id']})"
+                for i, row in enumerate(blocks, 1)
+            ]
+            text = "Choose a current pending block:\n" + "\n".join(rows)
+        else:
+            text = "There are no current pending blocks. Use /today to view your queue."
+        code = "BLOCK_SELECTION"
+    elif command == "done" and len(arguments) == 1 and target is not None:
+        text = (
+            f"Confirm block {target['block_id']} ({target['topic_id']}) with "
+            f"{target['planned_minutes']} minutes, or send /done {target['block_id']} "
+            f"{day['queue_revision']} {target['planned_minutes']} (0–1440)."
+        )
+        code = "DONE_CONFIRMATION_REQUIRED"
+    elif (
+        command == "done"
+        and len(arguments) == 3
+        and (
+            not arguments[1].isascii()
+            or not arguments[1].isdecimal()
+            or arguments[1] != str(day["queue_revision"])
+        )
+    ):
+        text = "Today's queue changed since you selected this block. Use /done to choose again."
+        code = "STALE_ACTION"
+    elif command == "done" and len(arguments) == 3 and target is None:
+        text = "That block is no longer pending in today's current queue. Use /today and choose again."
+        code = "STALE_ACTION"
+    elif (
+        command == "done"
+        and len(arguments) == 3
+        and parse_actual_minutes([arguments[2]])[1]
+    ):
+        text = "Use /done followed by a block ID, queue revision, and actual minutes (0–1440)."
+        code = "INVALID_ARGUMENTS"
+    elif target is None:
+        text = "That block is no longer pending in today's current queue. Use /today and choose again."
+        code = "STALE_ACTION"
+    elif command == "skip" and len(arguments) != 1:
+        text = "Use /skip followed by one block ID, or /skip to choose a current pending block."
+        code = "INVALID_ARGUMENTS"
+    elif command == "done" and len(arguments) != 3:
+        text = "Use /done followed by a block ID, queue revision, and actual minutes (0–1440)."
+        code = "INVALID_ARGUMENTS"
+    else:
+        minutes = parse_actual_minutes([arguments[2]])[0] if command == "done" else None
+        if command == "done":
+            actual_today = await conn.fetchval(
+                "SELECT COALESCE(sum(actual_minutes),0) FROM study_sessions WHERE study_date=$1",
+                today,
+            )
+            if actual_today + minutes > 1440:
+                text, code = (
+                    "Daily recorded study time cannot exceed 1440 minutes.",
+                    "TIME_BOUNDS",
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO study_sessions(session_id,topic_id,study_date,actual_minutes,block_id) VALUES($1,$2,$3,$4,$5)",
+                    uuid.uuid4(),
+                    target["topic_id"],
+                    today,
+                    minutes,
+                    target["block_id"],
+                )
+                await conn.execute(
+                    "UPDATE study_blocks SET status='done' WHERE block_id=$1 AND status='pending'",
+                    target["block_id"],
+                )
+                if minutes > 0:
+                    await conn.execute(
+                        "INSERT INTO topic_progress(topic_id,study_minutes) VALUES($1,$2) ON CONFLICT(topic_id) DO UPDATE SET study_minutes=topic_progress.study_minutes+$2",
+                        target["topic_id"],
+                        minutes,
+                    )
+                remaining_minutes = await conn.fetchval(
+                    "SELECT COALESCE(sum(b.planned_minutes),0) FROM study_blocks b WHERE b.plan_id=$1 AND b.status='pending'",
+                    day["current_plan_id"],
+                )
+                new_total = actual_today + minutes
+                over_budget = remaining_minutes > max(
+                    0, min(day["budget_minutes"], 90) - new_total
+                )
+                if over_budget:
+                    await conn.execute(
+                        "UPDATE study_days SET state='replan_required',queue_revision=queue_revision+1 WHERE study_date=$1",
+                        today,
+                    )
+                    text = "Recorded and closed this block. The remaining queue exceeds today's available time; history is preserved. Use /replan for a replacement."
+                    code = "REPLAN_REQUIRED"
+                else:
+                    await conn.execute(
+                        "UPDATE study_days SET queue_revision=queue_revision+1 WHERE study_date=$1",
+                        today,
+                    )
+                    text, code = (
+                        f"Recorded {minutes} minutes and closed the selected block. The topic remains incomplete unless you mark it complete separately.",
+                        "BLOCK_DONE",
+                    )
+                await conn.execute(
+                    "UPDATE engine_state SET state_revision=state_revision+1 WHERE singleton=true"
+                )
+        else:
+            await conn.execute(
+                "UPDATE study_blocks SET status='skipped' WHERE block_id=$1 AND status='pending'",
+                target["block_id"],
+            )
+            await conn.execute(
+                "UPDATE study_days SET queue_revision=queue_revision+1 WHERE study_date=$1",
+                today,
+            )
+            text, code = (
+                "Skipped the selected block. No study time was recorded and the queue was not refilled.",
+                "BLOCK_SKIPPED",
+            )
+    await conn.execute(
+        "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
+        operation_id,
+        code,
+    )
+    await conn.execute(
+        "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'done_skip',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+        uuid.uuid4(),
+        f"operation:{operation_id}:done_skip",
+        operation_id,
+        text,
+    )
 
 
 def fixed_error(status: int, code: str, retryable: bool = False) -> JSONResponse:
@@ -259,16 +444,30 @@ async def ingest(body: Update):
             "today",
             "replan",
             "budget",
+            "done",
+            "skip",
         )
         budget_value, budget_error = (
             parse_budget(body.payload.arguments)
             if body.payload.command == "budget"
             else (None, None)
         )
+        _, actual_error = (
+            parse_actual_minutes([body.payload.arguments[2]])
+            if body.payload.command == "done" and len(body.payload.arguments) == 3
+            else (None, None)
+        )
         operation_id = uuid.uuid4()
         status = (
             "accepted"
-            if authorized and implemented_command and budget_error != "INVALID_BUDGET"
+            if authorized
+            and implemented_command
+            and budget_error != "INVALID_BUDGET"
+            and not (
+                body.payload.command == "done"
+                and len(body.payload.arguments) == 3
+                and actual_error
+            )
             else "rejected"
         )
         result_code = (
@@ -280,6 +479,10 @@ async def ingest(body: Update):
             if not implemented_command
             else budget_error
             if budget_error is not None
+            else actual_error
+            if body.payload.command == "done"
+            and len(body.payload.arguments) == 3
+            and actual_error is not None
             else "HELP_READY"
             if body.payload.command == "help"
             else "PLAN_ACCEPTED"
@@ -313,6 +516,13 @@ async def ingest(body: Update):
                 f"operation:{operation_id}:help",
                 operation_id,
                 help_text(),
+            )
+        elif status == "accepted" and body.payload.command in ("done", "skip"):
+            await handle_block_command(
+                conn,
+                operation_id,
+                body.payload.command,
+                body.payload.arguments,
             )
         elif (
             status == "accepted"

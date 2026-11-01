@@ -146,7 +146,7 @@ def test_curriculum_module_imports_independently():
 def test_shared_help_explains_confirmation_and_topic_selection():
     text = help_text()
     assert (
-        "/done [block_id] [actual_minutes] - Record time and close a block after confirmation"
+        "/done [block_id] [queue_revision actual_minutes] - Choose a pending block, then confirm with its current queue revision and actual minutes"
         in text
     )
     assert (
@@ -161,7 +161,7 @@ def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
     future_commands = [
         name
         for name, _, _ in COMMANDS
-        if name not in ("help", "today", "replan", "budget")
+        if name not in ("help", "today", "replan", "budget", "done", "skip")
     ]
 
     for command in future_commands:
