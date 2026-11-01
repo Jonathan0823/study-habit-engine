@@ -30,8 +30,21 @@ CREATE TABLE IF NOT EXISTS engine_state (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     active_curriculum_id uuid,
     state_revision bigint NOT NULL DEFAULT 0,
-    progress_revision bigint NOT NULL DEFAULT 0
+    progress_revision bigint NOT NULL DEFAULT 0,
+    recovery_epoch uuid NOT NULL DEFAULT gen_random_uuid()
 );
+ALTER TABLE engine_state ADD COLUMN IF NOT EXISTS recovery_epoch uuid NOT NULL DEFAULT gen_random_uuid();
+-- Upgrade legacy numeric epochs to opaque UUIDs. Existing confirmations are
+-- invalidated because their numeric epoch cannot match the fresh engine epoch.
+DO $$
+BEGIN
+    IF (SELECT atttypid FROM pg_attribute
+        WHERE attrelid='engine_state'::regclass AND attname='recovery_epoch') <> 'uuid'::regtype THEN
+        ALTER TABLE engine_state ALTER COLUMN recovery_epoch DROP DEFAULT;
+        ALTER TABLE engine_state ALTER COLUMN recovery_epoch TYPE uuid USING gen_random_uuid();
+        ALTER TABLE engine_state ALTER COLUMN recovery_epoch SET DEFAULT gen_random_uuid();
+    END IF;
+END $$;
 INSERT INTO engine_state(singleton) VALUES (true) ON CONFLICT DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS curriculum_versions (
@@ -95,11 +108,57 @@ CREATE TABLE IF NOT EXISTS study_days (
     requested_generation bigint NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS action_confirmations (
+    token text PRIMARY KEY CHECK (octet_length(token) <= 48),
+    actor_id bigint NOT NULL,
+    chat_id bigint NOT NULL,
+    recovery_epoch uuid NOT NULL,
+    action text NOT NULL CHECK (action IN ('topic_complete','topic_reopen','block_done','progress_add','progress_edit','progress_reopen')),
+    target text NOT NULL,
+    study_date date NOT NULL,
+    state_revision bigint NOT NULL,
+    queue_revision bigint NOT NULL,
+    planned_minutes integer,
+    expires_at timestamptz NOT NULL,
+    consumed_at timestamptz,
+    result_code text,
+    result_text text,
+    context jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+ALTER TABLE action_confirmations ADD COLUMN IF NOT EXISTS context jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE action_confirmations DROP CONSTRAINT IF EXISTS action_confirmations_action_check;
+ALTER TABLE action_confirmations ADD CONSTRAINT action_confirmations_action_check
+    CHECK (action IN ('topic_complete','topic_reopen','block_done','progress_add','progress_edit','progress_reopen'));
+-- Legacy bigint confirmation epochs are replaced with UUIDs during upgrade;
+-- old tokens cannot match the new engine epoch.
+DO $$
+BEGIN
+    IF (SELECT atttypid FROM pg_attribute
+        WHERE attrelid='action_confirmations'::regclass AND attname='recovery_epoch') <> 'uuid'::regtype THEN
+        ALTER TABLE action_confirmations ALTER COLUMN recovery_epoch TYPE uuid USING gen_random_uuid();
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS topic_progress (
     topic_id text PRIMARY KEY,
     completed boolean NOT NULL DEFAULT false,
     study_minutes integer NOT NULL DEFAULT 0 CHECK (study_minutes >= 0)
 );
+
+CREATE TABLE IF NOT EXISTS topic_progress_audit (
+    audit_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    operation_id uuid NOT NULL REFERENCES operations(operation_id),
+    topic_id text NOT NULL,
+    before_state jsonb NOT NULL,
+    after_state jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE OR REPLACE FUNCTION prevent_topic_progress_audit_mutation() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'topic progress audit history is immutable'; END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS topic_progress_audit_immutable ON topic_progress_audit;
+CREATE TRIGGER topic_progress_audit_immutable BEFORE UPDATE OR DELETE ON topic_progress_audit
+    FOR EACH ROW EXECUTE FUNCTION prevent_topic_progress_audit_mutation();
 
 CREATE TABLE IF NOT EXISTS study_sessions (
     session_id uuid PRIMARY KEY,
@@ -107,6 +166,22 @@ CREATE TABLE IF NOT EXISTS study_sessions (
     study_date date NOT NULL,
     actual_minutes integer NOT NULL CHECK (actual_minutes BETWEEN 0 AND 1440)
 );
+
+CREATE TABLE IF NOT EXISTS study_session_audit (
+    audit_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    operation_id uuid NOT NULL REFERENCES operations(operation_id),
+    session_id uuid NOT NULL,
+    action text NOT NULL CHECK (action IN ('add','correct')),
+    before_state jsonb,
+    after_state jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE OR REPLACE FUNCTION prevent_study_session_audit_mutation() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'study session audit history is immutable'; END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS study_session_audit_immutable ON study_session_audit;
+CREATE TRIGGER study_session_audit_immutable BEFORE UPDATE OR DELETE ON study_session_audit
+    FOR EACH ROW EXECUTE FUNCTION prevent_study_session_audit_mutation();
 
 CREATE TABLE IF NOT EXISTS plans (
     plan_id uuid PRIMARY KEY,
@@ -139,6 +214,9 @@ CREATE TABLE IF NOT EXISTS study_blocks (
     status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done','skipped','cancelled','expired')),
     UNIQUE (plan_id, position)
 );
+
+ALTER TABLE study_sessions ADD COLUMN IF NOT EXISTS block_id uuid REFERENCES study_blocks(block_id);
+CREATE UNIQUE INDEX IF NOT EXISTS study_sessions_block_id_unique ON study_sessions(block_id) WHERE block_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS planning_jobs (
     job_id uuid PRIMARY KEY,

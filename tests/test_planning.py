@@ -42,3 +42,15 @@ def test_partial_final_block_and_under_minimum_capacity():
 def test_empty_eligibility_and_capacity_are_safe():
     assert allocate([topic("dependent", 1, prerequisites=("root",))], 60) == []
     assert allocate([topic("a", 0)], 0) == []
+
+
+def test_negative_capacity_allocates_no_blocks():
+    assert allocate([topic("a", 0)], -1) == []
+
+
+def test_allocator_excludes_topics_skipped_today():
+    candidates = [topic("skipped", 0), topic("available", 1)]
+    assert allocate(candidates, 60, {"skipped"}) == [
+        {"topic_id": "available", "planned_minutes": 30},
+        {"topic_id": "available", "planned_minutes": 30},
+    ]

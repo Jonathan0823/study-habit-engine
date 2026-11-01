@@ -104,6 +104,41 @@ def test_help_is_admitted_idempotently_and_outboxed(client):
     assert deliveries[0]["status"] == "pending"
 
 
+def test_budget_update_is_bounded_idempotent_and_replans(client):
+    headers = {"Authorization": "Bearer bot-secret"}
+    fence = poller(client)
+    body = update(next_update_id(), command="budget")
+    body["poller_fence"] = fence
+    body["payload"]["arguments"] = ["0"]
+    accepted = client.post("/v1/telegram/updates", json=body, headers=headers)
+    replay = client.post("/v1/telegram/updates", json=body, headers=headers)
+    assert accepted.json()["status"] == "accepted"
+    assert replay.json() == accepted.json()
+
+    invalid = update(next_update_id(), command="budget")
+    invalid["poller_fence"] = fence
+    invalid["payload"]["arguments"] = ["91"]
+    rejected = client.post("/v1/telegram/updates", json=invalid, headers=headers)
+    assert rejected.json()["status"] == "rejected"
+    assert rejected.json()["result"]["code"] == "INVALID_BUDGET"
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            day = await conn.fetchrow(
+                "SELECT budget_minutes,requested_generation,state FROM study_days WHERE study_date=(now() AT TIME ZONE 'Asia/Jakarta')::date"
+            )
+            return day, await conn.fetchval("SELECT count(*) FROM planning_jobs")
+        finally:
+            await conn.close()
+
+    day, jobs = asyncio.run(persisted())
+    assert day["budget_minutes"] == 0
+    assert day["requested_generation"] == 1
+    assert day["state"] == "replan_required"
+    assert jobs == 1
+
+
 def test_curriculum_module_imports_independently():
     subprocess.run([sys.executable, "-c", "import app.curriculum"], check=True)
 
@@ -111,7 +146,7 @@ def test_curriculum_module_imports_independently():
 def test_shared_help_explains_confirmation_and_topic_selection():
     text = help_text()
     assert (
-        "/done [block_id] [actual_minutes] - Record time and close a block after confirmation"
+        "/done [block_id] | <token> <actual_minutes> - Select a pending block by ID, then confirm with the displayed token and actual minutes"
         in text
     )
     assert (
@@ -120,11 +155,31 @@ def test_shared_help_explains_confirmation_and_topic_selection():
     )
 
 
+def test_help_and_ingestion_share_progress_command(client):
+    assert any(command[0] == "progress" for command in COMMANDS)
+    assert (
+        "/progress [YYYY-MM-DD | add TOPIC MINUTES [YYYY-MM-DD] | edit SESSION_ID YYYY-MM-DD MINUTES | reopen TOPIC_ID | confirm TOKEN]"
+        in help_text()
+    )
+
+
 def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
     headers = {"Authorization": "Bearer bot-secret"}
     fence = poller(client)
     future_commands = [
-        name for name, _, _ in COMMANDS if name not in ("help", "today", "replan")
+        name
+        for name, _, _ in COMMANDS
+        if name
+        not in (
+            "help",
+            "today",
+            "replan",
+            "budget",
+            "done",
+            "skip",
+            "complete_topic",
+            "progress",
+        )
     ]
 
     for command in future_commands:
@@ -177,7 +232,7 @@ def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
         finally:
             await conn.close()
 
-    assert asyncio.run(persisted()) == (len(future_commands) + 3, 1, 2, 1, 1)
+    assert asyncio.run(persisted()) == (len(future_commands) + 3, 0, 2, 1, 1)
 
 
 def test_update_id_with_different_content_conflicts(client):
