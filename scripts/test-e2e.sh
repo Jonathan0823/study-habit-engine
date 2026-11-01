@@ -10,10 +10,11 @@ engine_is_usable() {
   "$@" ls >/dev/null 2>&1
 }
 
+compose_project="study-habit-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$"
 if engine_is_usable docker docker compose; then
-  compose=(docker compose)
+  compose=(docker compose --project-name "$compose_project")
 elif engine_is_usable podman podman compose; then
-  compose=(podman compose)
+  compose=(podman compose --project-name "$compose_project")
 else
   cat >&2 <<'EOF'
 A reachable Docker or Podman engine with Compose support is required.
