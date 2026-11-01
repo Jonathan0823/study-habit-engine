@@ -1,0 +1,17 @@
+COMMANDS = (
+    ("help", "", "Show the eight supported commands and their usage"),
+    ("today", "", "View today's study queue; create it only when absent"),
+    ("done", "[block_id] [actual_minutes]", "Record time and close a block after confirmation; choose from pending blocks when omitted"),
+    ("skip", "[block_id]", "Skip a pending block; choose from pending blocks when omitted"),
+    ("complete_topic", "[topic_id]", "Choose from listed topics when omitted; preview prerequisites and queue impact, then confirm completion"),
+    ("budget", "[minutes]", "Set today's 0-90 minute budget; omit to be prompted"),
+    ("replan", "", "Request a replacement for today's unfinished queue"),
+    ("progress", "[YYYY-MM-DD]", "Browse history (today by default) and select a correction action"),
+)
+
+
+def help_text() -> str:
+    return "\n".join(
+        f"/{name}{(' ' + arguments) if arguments else ''} - {description}"
+        for name, arguments, description in COMMANDS
+    )
