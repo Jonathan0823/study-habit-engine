@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 import asyncpg
 
@@ -12,10 +13,10 @@ UPDATE_ID = 910001
 
 
 class TelegramMock(BaseHTTPRequestHandler):
-    offsets = []
-    sent_messages = []
-    ack_received = threading.Event()
-    release_ack = threading.Event()
+    offsets: ClassVar[list[int]] = []
+    sent_messages: ClassVar[list[dict]] = []
+    ack_received: ClassVar[threading.Event] = threading.Event()
+    release_ack: ClassVar[threading.Event] = threading.Event()
 
     def log_message(self, *_args):
         pass
@@ -64,9 +65,15 @@ async def persisted_path():
     try:
         operation = await conn.fetchrow("SELECT status FROM operations")
         ingestion = await conn.fetchrow("SELECT update_id FROM telegram_ingestion")
-        cursor = await conn.fetchval("SELECT next_offset FROM telegram_cursor WHERE bot_id=12345")
-        delivery = await conn.fetchrow("SELECT status, telegram_receipt FROM deliveries")
-        counts = await conn.fetchrow("SELECT (SELECT count(*) FROM operations) AS operations, (SELECT count(*) FROM deliveries) AS deliveries")
+        cursor = await conn.fetchval(
+            "SELECT next_offset FROM telegram_cursor WHERE bot_id=12345"
+        )
+        delivery = await conn.fetchrow(
+            "SELECT status, telegram_receipt FROM deliveries"
+        )
+        counts = await conn.fetchrow(
+            "SELECT (SELECT count(*) FROM operations) AS operations, (SELECT count(*) FROM deliveries) AS deliveries"
+        )
         return operation, ingestion, cursor, delivery, counts
     finally:
         await conn.close()
@@ -76,12 +83,16 @@ def main():
     async def reset_database():
         conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
         try:
-            await conn.execute("TRUNCATE deliveries, telegram_ingestion, operations, telegram_cursor CASCADE")
+            await conn.execute(
+                "TRUNCATE deliveries, telegram_ingestion, operations, telegram_cursor CASCADE"
+            )
         finally:
             await conn.close()
 
     asyncio.run(reset_database())
-    subprocess.run(["cargo", "build", "--quiet", "--bin", "study-habit-engine-bot"], check=True)
+    subprocess.run(
+        ["cargo", "build", "--quiet", "--bin", "study-habit-engine-bot"], check=True
+    )
     mock = ThreadingHTTPServer(("127.0.0.1", 0), TelegramMock)
     threading.Thread(target=mock.serve_forever, daemon=True).start()
     env = os.environ | {
@@ -108,18 +119,24 @@ def main():
         bot = launch()
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            operation, ingestion, cursor, delivery, counts = asyncio.run(persisted_path())
+            operation, ingestion, cursor, delivery, counts = asyncio.run(
+                persisted_path()
+            )
             if delivery and delivery["status"] == "sent":
                 break
             if bot.poll() is not None:
-                raise AssertionError(f"bot exited unexpectedly with status {bot.returncode}")
+                raise AssertionError(
+                    f"bot exited unexpectedly with status {bot.returncode}"
+                )
             time.sleep(0.1)
         else:
             raise AssertionError("bot did not persist and send the /help delivery")
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and not TelegramMock.ack_received.is_set():
             time.sleep(0.05)
-        assert TelegramMock.ack_received.is_set(), "polling did not acknowledge the durable next offset"
+        assert TelegramMock.ack_received.is_set(), (
+            "polling did not acknowledge the durable next offset"
+        )
         stop(bot)
         TelegramMock.release_ack.set()
 
@@ -133,7 +150,9 @@ def main():
         sent = TelegramMock.sent_messages[0]
         assert sent["chat_id"] == "111"
         assert sent["text"].startswith("/help - Show the eight supported commands")
-        print("Rust bot process: redelivery stayed idempotent, durable offset acknowledged, /help sent")
+        print(
+            "Rust bot process: redelivery stayed idempotent, durable offset acknowledged, /help sent"
+        )
     finally:
         TelegramMock.release_ack.set()
         for process in processes:

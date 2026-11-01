@@ -18,9 +18,13 @@ async def migrate() -> None:
     try:
         database = await connection.fetchval("SELECT current_database()")
         privileges = "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER"
-        await connection.execute(f'GRANT CONNECT ON DATABASE "{database}" TO "{runtime_role}"')
+        await connection.execute(
+            f'GRANT CONNECT ON DATABASE "{database}" TO "{runtime_role}"'
+        )
         await connection.execute(f'GRANT USAGE ON SCHEMA public TO "{runtime_role}"')
-        await connection.execute(f'GRANT {privileges} ON ALL TABLES IN SCHEMA public TO "{runtime_role}"')
+        await connection.execute(
+            f'GRANT {privileges} ON ALL TABLES IN SCHEMA public TO "{runtime_role}"'
+        )
         await connection.execute(
             f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT {privileges} ON TABLES TO "{runtime_role}"'
         )

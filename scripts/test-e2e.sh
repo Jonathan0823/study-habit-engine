@@ -15,6 +15,7 @@ export TELEGRAM_BOT_TOKEN=test-token
 export DATABASE_URL=postgresql://study_runtime:study-runtime-local@127.0.0.1:5432/study
 export MIGRATION_DATABASE_URL=postgresql://postgres:postgres-local-only@127.0.0.1:5432/study
 export BOT_SERVICE_TOKEN=bot-secret
+export ADMIN_SERVICE_TOKEN=admin-secret
 export TELEGRAM_BOT_ID=12345
 export TELEGRAM_USER_ID=111
 export TELEGRAM_PRIVATE_CHAT_ID=111
