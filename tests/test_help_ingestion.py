@@ -161,7 +161,8 @@ def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
     future_commands = [
         name
         for name, _, _ in COMMANDS
-        if name not in ("help", "today", "replan", "budget", "done", "skip")
+        if name
+        not in ("help", "today", "replan", "budget", "done", "skip", "complete_topic")
     ]
 
     for command in future_commands:

@@ -30,8 +30,21 @@ CREATE TABLE IF NOT EXISTS engine_state (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     active_curriculum_id uuid,
     state_revision bigint NOT NULL DEFAULT 0,
-    progress_revision bigint NOT NULL DEFAULT 0
+    progress_revision bigint NOT NULL DEFAULT 0,
+    recovery_epoch uuid NOT NULL DEFAULT gen_random_uuid()
 );
+ALTER TABLE engine_state ADD COLUMN IF NOT EXISTS recovery_epoch uuid NOT NULL DEFAULT gen_random_uuid();
+-- Upgrade legacy numeric epochs to opaque UUIDs. Existing confirmations are
+-- invalidated because their numeric epoch cannot match the fresh engine epoch.
+DO $$
+BEGIN
+    IF (SELECT atttypid FROM pg_attribute
+        WHERE attrelid='engine_state'::regclass AND attname='recovery_epoch') <> 'uuid'::regtype THEN
+        ALTER TABLE engine_state ALTER COLUMN recovery_epoch DROP DEFAULT;
+        ALTER TABLE engine_state ALTER COLUMN recovery_epoch TYPE uuid USING gen_random_uuid();
+        ALTER TABLE engine_state ALTER COLUMN recovery_epoch SET DEFAULT gen_random_uuid();
+    END IF;
+END $$;
 INSERT INTO engine_state(singleton) VALUES (true) ON CONFLICT DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS curriculum_versions (
@@ -94,6 +107,32 @@ CREATE TABLE IF NOT EXISTS study_days (
     current_plan_id uuid,
     requested_generation bigint NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS action_confirmations (
+    token text PRIMARY KEY CHECK (octet_length(token) <= 48),
+    actor_id bigint NOT NULL,
+    chat_id bigint NOT NULL,
+    recovery_epoch uuid NOT NULL,
+    action text NOT NULL CHECK (action IN ('topic_complete','topic_reopen','block_done')),
+    target text NOT NULL,
+    study_date date NOT NULL,
+    state_revision bigint NOT NULL,
+    queue_revision bigint NOT NULL,
+    planned_minutes integer,
+    expires_at timestamptz NOT NULL,
+    consumed_at timestamptz,
+    result_code text,
+    result_text text
+);
+-- Legacy bigint confirmation epochs are replaced with UUIDs during upgrade;
+-- old tokens cannot match the new engine epoch.
+DO $$
+BEGIN
+    IF (SELECT atttypid FROM pg_attribute
+        WHERE attrelid='action_confirmations'::regclass AND attname='recovery_epoch') <> 'uuid'::regtype THEN
+        ALTER TABLE action_confirmations ALTER COLUMN recovery_epoch TYPE uuid USING gen_random_uuid();
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS topic_progress (
     topic_id text PRIMARY KEY,

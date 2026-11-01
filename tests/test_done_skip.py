@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -60,7 +61,34 @@ def block_client():
                         "position": 0,
                         "prerequisites": [],
                         "resources": [],
-                    }
+                    },
+                    {
+                        "topic_id": "graphs",
+                        "title": "Graphs",
+                        "description": "Graphs",
+                        "estimate_minutes": 30,
+                        "position": 1,
+                        "prerequisites": ["arrays"],
+                        "resources": [],
+                    },
+                    {
+                        "topic_id": "trees",
+                        "title": "Trees",
+                        "description": "Trees",
+                        "estimate_minutes": 30,
+                        "position": 2,
+                        "prerequisites": ["graphs"],
+                        "resources": [],
+                    },
+                    {
+                        "topic_id": "strings",
+                        "title": "Strings",
+                        "description": "Strings",
+                        "estimate_minutes": 30,
+                        "position": 3,
+                        "prerequisites": [],
+                        "resources": [],
+                    },
                 ]
             }
             await conn.execute(
@@ -105,6 +133,50 @@ def block_client():
         yield client, first_block, second_block
 
 
+def test_apply_schema_adds_missing_recovery_epoch_column():
+    url = os.environ.get("MIGRATION_DATABASE_URL")
+    if not url:
+        pytest.skip("PostgreSQL integration test requires MIGRATION_DATABASE_URL")
+
+    async def migrate_legacy_table():
+        await apply_schema(url)
+        conn = await asyncpg.connect(url)
+        try:
+            await conn.execute("ALTER TABLE engine_state DROP COLUMN recovery_epoch")
+        finally:
+            await conn.close()
+        await apply_schema(url)
+        conn = await asyncpg.connect(url)
+        try:
+            return await conn.fetchrow(
+                "SELECT data_type,is_nullable,column_default FROM information_schema.columns WHERE table_name='engine_state' AND column_name='recovery_epoch'"
+            )
+        finally:
+            await conn.close()
+
+    column = asyncio.run(migrate_legacy_table())
+    assert column["data_type"] == "uuid"
+    assert column["is_nullable"] == "NO"
+    assert "gen_random_uuid" in column["column_default"]
+
+
+def _confirmation_token(response, command):
+    async def text_for_operation():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return await conn.fetchval(
+                "SELECT payload->>'text' FROM deliveries WHERE operation_id=$1",
+                uuid.UUID(response.json()["operation_id"]),
+            )
+        finally:
+            await conn.close()
+
+    text = asyncio.run(text_for_operation())
+    match = re.search(rf"/{command} ([A-Za-z0-9_-]{{43}})", text)
+    assert match, text
+    return match.group(1)
+
+
 def _payload(update_id, command, arguments):
     return {
         "bot_id": "12345",
@@ -123,10 +195,12 @@ def test_done_prefills_duration_records_once_and_invalidates_over_budget_queue(
     client, block_id, _ = block_client
     headers = {"Authorization": "Bearer bot-secret"}
     choice = client.post(
-        "/v1/telegram/updates", headers=headers, json=_payload(100, "done", [])
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(100, "done", [str(block_id)]),
     )
     assert choice.status_code == 200
-    assert choice.json()["status"] == "accepted"
+    assert choice.json()["status"] == "completed"
 
     async def choice_text():
         conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
@@ -140,8 +214,8 @@ def test_done_prefills_duration_records_once_and_invalidates_over_budget_queue(
 
     assert "30 min" in asyncio.run(choice_text())
 
-    args = [str(block_id), "1", "40"]
-    update = _payload(101, "done", args)
+    token = _confirmation_token(choice, "done")
+    update = _payload(101, "done", [token, "40"])
     done = client.post("/v1/telegram/updates", headers=headers, json=update)
     replay = client.post("/v1/telegram/updates", headers=headers, json=update)
     assert done.json()["operation_id"] == replay.json()["operation_id"]
@@ -191,7 +265,9 @@ def test_done_prefills_duration_records_once_and_invalidates_over_budget_queue(
     assert study_minutes == 40
 
     stale = client.post(
-        "/v1/telegram/updates", headers=headers, json=_payload(102, "done", args)
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(102, "done", [token, "40"]),
     )
     assert stale.status_code == 200
 
@@ -216,7 +292,7 @@ def test_stale_confirmation_rejected_then_fresh_revision_succeeds(block_client):
         json=_payload(140, "done", [str(block_id)]),
     )
     assert selected.status_code == 200
-    assert selected.json()["status"] == "accepted"
+    assert selected.json()["status"] == "completed"
 
     async def selection_text(operation_id):
         conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
@@ -228,9 +304,8 @@ def test_stale_confirmation_rejected_then_fresh_revision_succeeds(block_client):
         finally:
             await conn.close()
 
-    assert f"/done {block_id} 1 30" in asyncio.run(
-        selection_text(selected.json()["operation_id"])
-    )
+    token = _confirmation_token(selected, "done")
+    assert token
 
     async def advance_queue_revision():
         conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
@@ -243,7 +318,7 @@ def test_stale_confirmation_rejected_then_fresh_revision_succeeds(block_client):
             await conn.close()
 
     asyncio.run(advance_queue_revision())
-    stale_update = _payload(141, "done", [str(block_id), "1", "30"])
+    stale_update = _payload(141, "done", [token, "30"])
     client.post("/v1/telegram/updates", headers=headers, json=stale_update)
     stale = client.post("/v1/telegram/updates", headers=headers, json=stale_update)
     assert stale.status_code == 200
@@ -272,10 +347,8 @@ def test_stale_confirmation_rejected_then_fresh_revision_succeeds(block_client):
         headers=headers,
         json=_payload(142, "done", [str(block_id)]),
     )
-    assert f"/done {block_id} 2 30" in asyncio.run(
-        selection_text(fresh.json()["operation_id"])
-    )
-    confirm_update = _payload(143, "done", [str(block_id), "2", "25"])
+    fresh_token = _confirmation_token(fresh, "done")
+    confirm_update = _payload(143, "done", [fresh_token, "25"])
     client.post("/v1/telegram/updates", headers=headers, json=confirm_update)
     confirmed = client.post(
         "/v1/telegram/updates", headers=headers, json=confirm_update
@@ -286,12 +359,20 @@ def test_stale_confirmation_rejected_then_fresh_revision_succeeds(block_client):
 
 def test_zero_done_closes_block_without_starting_topic(block_client):
     client, block_id, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
     response = client.post(
         "/v1/telegram/updates",
-        headers={"Authorization": "Bearer bot-secret"},
-        json=_payload(150, "done", [str(block_id), "1", "0"]),
+        headers=headers,
+        json=_payload(150, "done", [str(block_id)]),
     )
-    assert response.status_code == 200
+    token = _confirmation_token(response, "done")
+    confirmed = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(151, "done", [token, "0"]),
+    )
+    assert confirmed.status_code == 200
+    assert confirmed.json()["result"]["code"] == "BLOCK_DONE"
 
     async def persisted():
         conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
@@ -340,3 +421,681 @@ def test_skip_closes_only_selected_block_without_time_or_refill(block_client):
             await conn.close()
 
     assert asyncio.run(persisted()) == ("skipped", "pending", 0, "valid")
+
+
+@pytest.mark.parametrize(("field", "value"), [("actor_id", 222), ("chat_id", 222)])
+def test_consumed_topic_confirmation_checks_identity_before_replay(
+    block_client, field, value
+):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(290, "complete_topic", ["arrays"]),
+    )
+    token = _confirmation_token(preview, "complete_topic")
+    client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(291, "complete_topic", [token]),
+    )
+
+    async def change_identity():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                f"UPDATE action_confirmations SET {field}=$2 WHERE token=$1",
+                token,
+                value,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(change_identity())
+    replay = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(292, "complete_topic", [token]),
+    )
+    assert replay.json()["result"]["code"] == "STALE_ACTION"
+
+
+@pytest.mark.parametrize(("field", "value"), [("actor_id", 222), ("chat_id", 222)])
+def test_consumed_done_confirmation_checks_identity_before_replay(
+    block_client, field, value
+):
+    client, block_id, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(293, "done", [str(block_id)]),
+    )
+    token = _confirmation_token(preview, "done")
+    client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(294, "done", [token, "30"]),
+    )
+
+    async def change_identity():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                f"UPDATE action_confirmations SET {field}=$2 WHERE token=$1",
+                token,
+                value,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(change_identity())
+    replay = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(295, "done", [token, "30"]),
+    )
+    assert replay.json()["result"]["code"] == "STALE_ACTION"
+
+
+def test_complete_topic_requires_confirmation_and_replay_is_idempotent(block_client):
+    client, block_id, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(300, "complete_topic", ["arrays"]),
+    )
+    assert preview.json()["result"]["code"] == "TOPIC_CONFIRMATION_REQUIRED"
+    token = _confirmation_token(preview, "complete_topic")
+    confirm = _payload(301, "complete_topic", [token])
+    client.post("/v1/telegram/updates", headers=headers, json=confirm)
+    replay = client.post("/v1/telegram/updates", headers=headers, json=confirm)
+    assert replay.json()["result"]["code"] == "TOPIC_COMPLETED"
+    second_replay = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(302, "complete_topic", [token]),
+    )
+    assert second_replay.json()["result"]["code"] == "TOPIC_COMPLETED"
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval(
+                    "SELECT completed FROM topic_progress WHERE topic_id='arrays'"
+                ),
+                await conn.fetchval(
+                    "SELECT status FROM study_blocks WHERE block_id=$1", block_id
+                ),
+                await conn.fetchval(
+                    "SELECT count(*) FROM study_blocks WHERE status='pending'"
+                ),
+                await conn.fetchval("SELECT count(*) FROM study_sessions"),
+                await conn.fetchval(
+                    "SELECT count(*) FROM deliveries WHERE payload->>'text'='Completed arrays. The queue was not refilled.'"
+                ),
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(persisted()) == (True, "cancelled", 0, 0, 1)
+
+
+def test_replaying_consumed_done_confirmation_does_not_enqueue_delivery(block_client):
+    client, block_id, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(303, "done", [str(block_id)]),
+    )
+    token = _confirmation_token(preview, "done")
+    done = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(304, "done", [token, "30"]),
+    )
+    replay = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(305, "done", [token, "30"]),
+    )
+    assert replay.json()["result"] == done.json()["result"]
+
+    async def delivery_count():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return await conn.fetchval(
+                "SELECT count(*) FROM deliveries WHERE kind='done_skip'"
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(delivery_count()) == 2
+
+
+def test_topic_action_token_rejects_progress_change_without_revision(block_client):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(309, "complete_topic", ["arrays"]),
+    )
+    token = _confirmation_token(preview, "complete_topic")
+
+    async def change_progress_without_revision():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO topic_progress(topic_id,completed) VALUES('arrays',true)"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(change_progress_without_revision())
+    result = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(310, "complete_topic", [token]),
+    )
+    assert result.json()["result"]["code"] == "STALE_ACTION"
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval(
+                    "SELECT completed FROM topic_progress WHERE topic_id='arrays'"
+                ),
+                await conn.fetchval(
+                    "SELECT state_revision FROM engine_state WHERE singleton=true"
+                ),
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(persisted()) == (True, 0)
+
+
+def test_consumed_topic_confirmation_rejects_replay_after_recovery_epoch_changes(
+    block_client,
+):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(330, "complete_topic", ["arrays"]),
+    )
+    token = _confirmation_token(preview, "complete_topic")
+    confirm = _payload(331, "complete_topic", [token])
+    consumed = client.post("/v1/telegram/updates", headers=headers, json=confirm)
+    assert consumed.json()["result"]["code"] == "TOPIC_COMPLETED"
+
+    async def change_epoch():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE engine_state SET recovery_epoch=gen_random_uuid() WHERE singleton=true"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(change_epoch())
+    replay = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(332, "complete_topic", [token]),
+    )
+    assert replay.json()["result"]["code"] == "STALE_ACTION"
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval(
+                    "SELECT count(*) FROM operations WHERE result->'result'->>'code'='TOPIC_COMPLETED'"
+                ),
+                await conn.fetchval(
+                    "SELECT count(*) FROM deliveries WHERE payload->>'text'='Completed arrays. The queue was not refilled.'"
+                ),
+                await conn.fetchval(
+                    "SELECT completed FROM topic_progress WHERE topic_id='arrays'"
+                ),
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(persisted()) == (1, 1, True)
+
+
+def test_consumed_done_confirmation_rejects_replay_after_recovery_epoch_changes(
+    block_client,
+):
+    client, block_id, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(333, "done", [str(block_id)]),
+    )
+    token = _confirmation_token(preview, "done")
+    confirmation = _payload(334, "done", [token, "30"])
+    consumed = client.post("/v1/telegram/updates", headers=headers, json=confirmation)
+    assert consumed.json()["result"]["code"] == "BLOCK_DONE"
+
+    async def change_epoch():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE engine_state SET recovery_epoch=gen_random_uuid() WHERE singleton=true"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(change_epoch())
+    replay = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(335, "done", [token, "30"]),
+    )
+    assert replay.json()["result"]["code"] == "STALE_ACTION"
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval(
+                    "SELECT count(*) FROM study_sessions WHERE block_id=$1", block_id
+                ),
+                await conn.fetchval(
+                    "SELECT count(*) FROM operations WHERE result->'result'->>'code'='BLOCK_DONE'"
+                ),
+                await conn.fetchval(
+                    "SELECT count(*) FROM deliveries WHERE payload->>'text' LIKE 'Recorded 30 minutes%'"
+                ),
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(persisted()) == (1, 1, 1)
+
+
+def test_consumed_topic_token_cannot_replay_through_done(block_client):
+    client, block_id, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(311, "complete_topic", ["arrays"]),
+    )
+    token = _confirmation_token(preview, "complete_topic")
+    confirmed = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(312, "complete_topic", [token]),
+    )
+    assert confirmed.json()["result"]["code"] == "TOPIC_COMPLETED"
+    replay = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(313, "done", [token, "30"]),
+    )
+    assert replay.json()["result"]["code"] == "STALE_ACTION"
+
+    async def unchanged():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval("SELECT count(*) FROM study_sessions"),
+                await conn.fetchval(
+                    "SELECT status FROM study_blocks WHERE block_id=$1", block_id
+                ),
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(unchanged()) == (0, "cancelled")
+
+
+def test_topic_confirmation_rejects_stale_queue_revision(block_client):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(305, "complete_topic", ["arrays"]),
+    )
+    assert preview.json()["status"] == "completed"
+
+    async def advance_queue():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute("UPDATE study_days SET queue_revision=2")
+        finally:
+            await conn.close()
+
+    asyncio.run(advance_queue())
+    token = _confirmation_token(preview, "complete_topic")
+    confirm = _payload(306, "complete_topic", [token])
+    client.post("/v1/telegram/updates", headers=headers, json=confirm)
+    result = client.post("/v1/telegram/updates", headers=headers, json=confirm)
+    assert result.json()["result"]["code"] == "STALE_ACTION"
+
+    async def still_incomplete():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return await conn.fetchval(
+                "SELECT count(*) FROM topic_progress WHERE topic_id='arrays'"
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(still_incomplete()) == 0
+
+
+def test_topic_confirmation_rejects_changed_recovery_epoch_without_mutation(
+    block_client,
+):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(307, "complete_topic", ["arrays"]),
+    )
+    assert preview.json()["result"]["code"] == "TOPIC_CONFIRMATION_REQUIRED"
+    token = _confirmation_token(preview, "complete_topic")
+
+    async def change_epoch():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE engine_state SET recovery_epoch=gen_random_uuid() WHERE singleton=true"
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(change_epoch())
+    result = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(308, "complete_topic", [token]),
+    )
+    assert result.status_code == 200
+    assert result.json()["result"]["code"] == "STALE_ACTION"
+
+    async def unchanged():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval("SELECT count(*) FROM topic_progress"),
+                await conn.fetchval("SELECT count(*) FROM study_sessions"),
+                await conn.fetchval(
+                    "SELECT consumed_at FROM action_confirmations WHERE token=$1", token
+                ),
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(unchanged()) == (0, 0, None)
+
+
+def test_concurrent_topic_confirmation_consumes_action_once(block_client):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+
+    async def record_existing_study_time():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO topic_progress(topic_id,completed,study_minutes) VALUES('arrays',false,27)"
+            )
+            await conn.execute(
+                "INSERT INTO study_sessions(session_id,topic_id,study_date,actual_minutes) VALUES($1,'arrays',$2,27)",
+                uuid.uuid4(),
+                datetime.now(ZoneInfo("Asia/Jakarta")).date(),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(record_existing_study_time())
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(309, "complete_topic", ["arrays"]),
+    )
+    token = _confirmation_token(preview, "complete_topic")
+    updates = [
+        _payload(update_id, "complete_topic", [token]) for update_id in (310, 311)
+    ]
+
+    async def concurrently_confirm():
+        return await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    client.post,
+                    "/v1/telegram/updates",
+                    headers=headers,
+                    json=update,
+                )
+                for update in updates
+            )
+        )
+
+    first, second = asyncio.run(concurrently_confirm())
+    assert first.status_code == second.status_code == 200
+    assert first.json()["result"] == second.json()["result"]
+    assert first.json()["result"]["code"] == "TOPIC_COMPLETED"
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval(
+                    "SELECT completed FROM topic_progress WHERE topic_id='arrays'"
+                ),
+                await conn.fetchval(
+                    "SELECT study_minutes FROM topic_progress WHERE topic_id='arrays'"
+                ),
+                await conn.fetchval("SELECT count(*) FROM study_sessions"),
+                await conn.fetchval(
+                    "SELECT count(*) FROM operations WHERE result->'result'->>'code'='TOPIC_COMPLETED'"
+                ),
+                await conn.fetchval(
+                    "SELECT count(*) FROM deliveries WHERE logical_key LIKE 'operation:%:topic' AND payload->>'text' = 'Completed arrays. The queue was not refilled.'"
+                ),
+                await conn.fetchrow(
+                    "SELECT consumed_at,result_code,result_text FROM action_confirmations WHERE token=$1",
+                    token,
+                ),
+            )
+        finally:
+            await conn.close()
+
+    completed, minutes, sessions, results, deliveries, confirmation = asyncio.run(
+        persisted()
+    )
+    assert completed is True
+    assert minutes == 27
+    assert sessions == 1
+    assert results == 2
+    assert deliveries == 1
+    assert confirmation["consumed_at"] is not None
+    assert confirmation["result_code"] == "TOPIC_COMPLETED"
+    assert confirmation["result_text"]
+
+
+def test_confirmation_binding_and_expiry_reject_without_mutation(block_client):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(320, "complete_topic", ["arrays"]),
+    )
+    token = _confirmation_token(preview, "complete_topic")
+
+    async def change_actor():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE action_confirmations SET actor_id=222 WHERE token=$1", token
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(change_actor())
+    # An actor mismatch is rejected; the record remains unconsumed.
+    mismatch = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(321, "complete_topic", [token]),
+    )
+    assert mismatch.json()["result"]["code"] == "STALE_ACTION"
+
+    async def expiration():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE action_confirmations SET actor_id=111,expires_at=now()-interval '1 second' WHERE token=$1",
+                token,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(expiration())
+    expired = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(322, "complete_topic", [token]),
+    )
+    assert expired.json()["result"]["code"] == "STALE_ACTION"
+
+    async def unmodified():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval("SELECT count(*) FROM topic_progress"),
+                await conn.fetchval(
+                    "SELECT consumed_at FROM action_confirmations WHERE token=$1", token
+                ),
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(unmodified()) == (0, None)
+
+
+def test_reopening_prerequisite_reopens_dependents_preserving_minutes(block_client):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+
+    async def setup_progress():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO topic_progress(topic_id,completed,study_minutes) VALUES('arrays',true,15),('graphs',true,20),('trees',true,25)"
+            )
+            plan_id = await conn.fetchval("SELECT current_plan_id FROM study_days")
+            await conn.execute(
+                "INSERT INTO study_blocks(block_id,plan_id,position,topic_id,planned_minutes) VALUES($1,$2,2,'strings',30)",
+                uuid.uuid4(),
+                plan_id,
+            )
+            await conn.execute(
+                "INSERT INTO study_sessions(session_id,topic_id,study_date,actual_minutes) VALUES($1,'graphs',$2,20),($3,'trees',$2,25)",
+                uuid.uuid4(),
+                datetime.now(ZoneInfo("Asia/Jakarta")).date(),
+                uuid.uuid4(),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup_progress())
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(310, "complete_topic", ["arrays"]),
+    )
+    assert preview.json()["result"]["code"] == "REOPEN_CONFIRMATION_REQUIRED"
+    token = _confirmation_token(preview, "complete_topic")
+    confirm = _payload(311, "complete_topic", [token])
+    client.post("/v1/telegram/updates", headers=headers, json=confirm)
+    result = client.post("/v1/telegram/updates", headers=headers, json=confirm)
+    assert result.json()["result"]["code"] == "TOPICS_REOPENED"
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetch(
+                    "SELECT topic_id,completed,study_minutes FROM topic_progress ORDER BY topic_id"
+                ),
+                await conn.fetchval("SELECT sum(actual_minutes) FROM study_sessions"),
+                await conn.fetchval("SELECT state FROM study_days"),
+                await conn.fetchval(
+                    "SELECT status FROM study_blocks WHERE topic_id='strings'"
+                ),
+            )
+        finally:
+            await conn.close()
+
+    progress, minutes, state, unaffected_block_status = asyncio.run(persisted())
+    assert [(r["topic_id"], r["completed"], r["study_minutes"]) for r in progress] == [
+        ("arrays", False, 15),
+        ("graphs", False, 20),
+        ("trees", False, 25),
+    ]
+    assert (minutes, state, unaffected_block_status) == (45, "valid", "pending")
+
+
+def test_reopening_prerequisite_invalidates_pending_dependent_block(block_client):
+    client, _, _ = block_client
+    headers = {"Authorization": "Bearer bot-secret"}
+
+    async def setup_dependent_block():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO topic_progress(topic_id,completed) VALUES('arrays',true),('graphs',true),('trees',true)"
+            )
+            plan_id = await conn.fetchval("SELECT current_plan_id FROM study_days")
+            await conn.execute(
+                "INSERT INTO study_blocks(block_id,plan_id,position,topic_id,planned_minutes) VALUES($1,$2,2,'trees',30)",
+                uuid.uuid4(),
+                plan_id,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup_dependent_block())
+    preview = client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(312, "complete_topic", ["arrays"]),
+    )
+    token = _confirmation_token(preview, "complete_topic")
+    client.post(
+        "/v1/telegram/updates",
+        headers=headers,
+        json=_payload(313, "complete_topic", [token]),
+    )
+
+    async def persisted():
+        conn = await asyncpg.connect(os.environ["MIGRATION_DATABASE_URL"])
+        try:
+            return (
+                await conn.fetchval("SELECT state FROM study_days"),
+                await conn.fetchval(
+                    "SELECT status FROM study_blocks WHERE topic_id='trees'"
+                ),
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(persisted()) == ("replan_required", "cancelled")

@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
@@ -131,7 +132,341 @@ async def lock_replan_state(conn, study_date, budget_value: int | None = None):
     return old_jobs, day
 
 
-async def handle_block_command(conn, operation_id, command: str, arguments: list[str]):
+def completed_dependents(topic_id, topics, completed):
+    dependents = set()
+    frontier = {topic_id}
+    while frontier:
+        following = {
+            tid
+            for tid, topic in topics.items()
+            if tid in completed
+            and tid not in dependents
+            and frontier.intersection(topic["prerequisites"])
+        }
+        dependents.update(following)
+        frontier = following
+    return dependents
+
+
+async def issue_action_confirmation(
+    conn,
+    actor_id,
+    chat_id,
+    action,
+    target,
+    study_date,
+    state_revision,
+    queue_revision,
+    recovery_epoch,
+    planned_minutes=None,
+):
+    token = secrets.token_urlsafe(32)
+    await conn.execute(
+        """INSERT INTO action_confirmations(token,actor_id,chat_id,recovery_epoch,action,target,study_date,state_revision,queue_revision,planned_minutes,expires_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now()+interval '10 minutes')""",
+        token,
+        actor_id,
+        chat_id,
+        recovery_epoch,
+        action,
+        str(target),
+        study_date,
+        state_revision,
+        queue_revision,
+        planned_minutes,
+    )
+    return token
+
+
+async def handle_topic_command(
+    conn,
+    operation_id,
+    arguments: list[str],
+    actor_id: int,
+    chat_id: int,
+    token_action: str | None = None,
+):
+    from datetime import datetime
+
+    from app.planning import JAKARTA
+
+    today = datetime.now(JAKARTA).date()
+    await conn.execute(
+        "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT DO NOTHING", today
+    )
+    day = await conn.fetchrow(
+        "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", today
+    )
+    state = await conn.fetchrow(
+        "SELECT * FROM engine_state WHERE singleton=true FOR UPDATE"
+    )
+    enqueue_delivery = True
+    if state["active_curriculum_id"] is None:
+        text, code = "There is no active curriculum.", "NO_ACTIVE_CURRICULUM"
+    else:
+        curriculum = await conn.fetchrow(
+            "SELECT content FROM curriculum_versions WHERE curriculum_id=$1 AND status='approved'",
+            state["active_curriculum_id"],
+        )
+        content = (
+            curriculum["content"]
+            if isinstance(curriculum["content"], dict)
+            else json.loads(curriculum["content"])
+        )
+        topics = {topic["topic_id"]: topic for topic in content["topics"]}
+        progress_rows = await conn.fetch(
+            "SELECT topic_id,completed FROM topic_progress"
+        )
+        completed = {r["topic_id"] for r in progress_rows if r["completed"]}
+        if not arguments:
+            eligible = [
+                t["topic_id"]
+                for t in content["topics"]
+                if t["topic_id"] not in completed
+                and set(t["prerequisites"]) <= completed
+            ]
+            text, code = (
+                ("Eligible topics: " + ", ".join(eligible), "TOPIC_SELECTION")
+                if eligible
+                else ("No eligible topics to complete.", "NO_ELIGIBLE_TOPICS")
+            )
+        elif len(arguments) == 1 and arguments[0] in topics:
+            topic_id = arguments[0]
+            if topic_id in completed:
+                dependents = completed_dependents(topic_id, topics, completed)
+                token = await issue_action_confirmation(
+                    conn,
+                    actor_id,
+                    chat_id,
+                    "topic_reopen",
+                    topic_id,
+                    today,
+                    state["state_revision"],
+                    day["queue_revision"],
+                    state["recovery_epoch"],
+                )
+                text = f"Reopening {topic_id} will also reopen completed dependents: {', '.join(sorted(dependents)) or 'none'}. Confirm with /complete_topic {token}."
+                code = "REOPEN_CONFIRMATION_REQUIRED"
+            elif not set(topics[topic_id]["prerequisites"]) <= completed:
+                text, code = (
+                    "This topic is not eligible until all prerequisites are complete.",
+                    "TOPIC_NOT_ELIGIBLE",
+                )
+            else:
+                token = await issue_action_confirmation(
+                    conn,
+                    actor_id,
+                    chat_id,
+                    "topic_complete",
+                    topic_id,
+                    today,
+                    state["state_revision"],
+                    day["queue_revision"],
+                    state["recovery_epoch"],
+                )
+                text = f"Complete {topic_id}? Confirm with /complete_topic {token}."
+                code = "TOPIC_CONFIRMATION_REQUIRED"
+        elif len(arguments) == 1 and arguments[0] not in topics:
+            confirmation = await conn.fetchrow(
+                "SELECT * FROM action_confirmations WHERE token=$1 FOR UPDATE",
+                arguments[0],
+            )
+            if confirmation is None or confirmation["action"] not in (
+                "topic_complete",
+                "topic_reopen",
+            ):
+                text, code = (
+                    "Confirmation is invalid or expired. Preview again.",
+                    "STALE_ACTION",
+                )
+            elif (
+                confirmation["actor_id"] != actor_id
+                or confirmation["chat_id"] != chat_id
+                or confirmation["recovery_epoch"] != state["recovery_epoch"]
+            ):
+                text, code = (
+                    "Study state changed. Use /complete_topic to preview again.",
+                    "STALE_ACTION",
+                )
+            elif confirmation["consumed_at"] is not None:
+                text, code = confirmation["result_text"], confirmation["result_code"]
+                enqueue_delivery = False
+            elif (
+                confirmation["study_date"] != today
+                or confirmation["expires_at"] <= await conn.fetchval("SELECT now()")
+                or confirmation["state_revision"] != state["state_revision"]
+                or confirmation["queue_revision"] != day["queue_revision"]
+                or confirmation["target"] not in topics
+            ):
+                text, code = (
+                    "Study state changed. Use /complete_topic to preview again.",
+                    "STALE_ACTION",
+                )
+            else:
+                await handle_topic_command(
+                    conn,
+                    operation_id,
+                    [
+                        confirmation["target"],
+                        str(confirmation["state_revision"]),
+                        str(confirmation["queue_revision"]),
+                        "confirm",
+                    ],
+                    actor_id,
+                    chat_id,
+                    token_action=confirmation["action"],
+                )
+                saved = await conn.fetchrow(
+                    "SELECT result FROM operations WHERE operation_id=$1", operation_id
+                )
+                delivery = await conn.fetchval(
+                    "SELECT payload->>'text' FROM deliveries WHERE logical_key=$1",
+                    f"operation:{operation_id}:topic",
+                )
+                saved_result = (
+                    saved["result"]
+                    if isinstance(saved["result"], dict)
+                    else json.loads(saved["result"])
+                )
+                text, code = delivery, saved_result["result"]["code"]
+                await conn.execute(
+                    "UPDATE action_confirmations SET consumed_at=now(),result_code=$2,result_text=$3 WHERE token=$1",
+                    arguments[0],
+                    code,
+                    text,
+                )
+        elif len(arguments) == 4 and arguments[3] == "confirm":
+            topic_id = arguments[0]
+            if token_action not in ("topic_complete", "topic_reopen"):
+                text, code = (
+                    "Use the tokenized confirmation shown in the preview.",
+                    "INVALID_ARGUMENTS",
+                )
+                topic_id = None
+            revision, queue_revision = arguments[1:3]
+            if (
+                token_action not in ("topic_complete", "topic_reopen")
+                or topic_id not in topics
+                or not revision.isascii()
+                or not revision.isdecimal()
+                or not queue_revision.isascii()
+                or not queue_revision.isdecimal()
+                or int(revision) != state["state_revision"]
+                or int(queue_revision) != day["queue_revision"]
+            ):
+                text, code = (
+                    "Study state changed. Use /complete_topic to preview again.",
+                    "STALE_ACTION",
+                )
+            elif (token_action == "topic_reopen" and topic_id not in completed) or (
+                token_action == "topic_complete" and topic_id in completed
+            ):
+                text, code = (
+                    "Topic state changed. Use /complete_topic to preview again.",
+                    "STALE_ACTION",
+                )
+            elif token_action == "topic_reopen":
+                reopened = {topic_id} | completed_dependents(
+                    topic_id, topics, completed
+                )
+                await conn.execute(
+                    "UPDATE topic_progress SET completed=false WHERE topic_id=ANY($1::text[])",
+                    list(reopened),
+                )
+                completed_after_reopen = completed - reopened
+                pending_blocks = []
+                if day["current_plan_id"] is not None:
+                    pending_blocks = await conn.fetch(
+                        "SELECT block_id,topic_id FROM study_blocks WHERE plan_id=$1 AND status='pending'",
+                        day["current_plan_id"],
+                    )
+                invalid_pending = {
+                    block["topic_id"]
+                    for block in pending_blocks
+                    if block["topic_id"] not in topics
+                    or block["topic_id"] in completed_after_reopen
+                    or not set(topics[block["topic_id"]]["prerequisites"])
+                    <= completed_after_reopen
+                }
+                cancelled_topics = invalid_pending
+                if day["current_plan_id"] is not None and cancelled_topics:
+                    await conn.execute(
+                        "UPDATE study_blocks SET status='cancelled' WHERE plan_id=$1 AND status='pending' AND topic_id=ANY($2::text[])",
+                        day["current_plan_id"],
+                        list(cancelled_topics),
+                    )
+                next_state = "replan_required" if invalid_pending else day["state"]
+                await conn.execute(
+                    "UPDATE study_days SET state=$2,queue_revision=queue_revision+1 WHERE study_date=$1",
+                    today,
+                    next_state,
+                )
+                await conn.execute(
+                    "UPDATE engine_state SET state_revision=state_revision+1,progress_revision=progress_revision+1 WHERE singleton=true"
+                )
+                text, code = (
+                    f"Reopened {', '.join(sorted(reopened))}. Recorded study time and history were preserved; use /replan to refresh the queue.",
+                    "TOPICS_REOPENED",
+                )
+            elif (
+                token_action != "topic_complete"
+                or not set(topics[topic_id]["prerequisites"]) <= completed
+            ):
+                text, code = (
+                    "Prerequisites changed. Use /complete_topic to preview again.",
+                    "STALE_ACTION",
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO topic_progress(topic_id,completed) VALUES($1,true) ON CONFLICT(topic_id) DO UPDATE SET completed=true",
+                    topic_id,
+                )
+                if day["current_plan_id"] is not None:
+                    await conn.execute(
+                        "UPDATE study_blocks SET status='cancelled' WHERE plan_id=$1 AND status='pending' AND topic_id=$2",
+                        day["current_plan_id"],
+                        topic_id,
+                    )
+                await conn.execute(
+                    "UPDATE study_days SET queue_revision=queue_revision+1 WHERE study_date=$1",
+                    today,
+                )
+                await conn.execute(
+                    "UPDATE engine_state SET state_revision=state_revision+1,progress_revision=progress_revision+1 WHERE singleton=true"
+                )
+                text, code = (
+                    f"Completed {topic_id}. The queue was not refilled.",
+                    "TOPIC_COMPLETED",
+                )
+        else:
+            text, code = (
+                "Use /complete_topic [topic_id] to preview, then confirm with the shown state and queue revisions.",
+                "INVALID_ARGUMENTS",
+            )
+    await conn.execute(
+        "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
+        operation_id,
+        code,
+    )
+    if enqueue_delivery:
+        await conn.execute(
+            "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'topic',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+            uuid.uuid4(),
+            f"operation:{operation_id}:topic",
+            operation_id,
+            text,
+        )
+
+
+async def handle_block_command(
+    conn,
+    operation_id,
+    command: str,
+    arguments: list[str],
+    actor_id: int,
+    chat_id: int,
+    token_authorized=False,
+):
     from datetime import datetime
 
     from app.planning import JAKARTA
@@ -164,6 +499,107 @@ async def handle_block_command(conn, operation_id, command: str, arguments: list
         if day["current_plan_id"] is not None and day["state"] == "valid"
         else []
     )
+    confirmation_token = None
+    if command == "done" and len(arguments) == 2:
+        confirmation_token = arguments[0]
+        confirmation = await conn.fetchrow(
+            "SELECT * FROM action_confirmations WHERE token=$1 FOR UPDATE",
+            confirmation_token,
+        )
+        now = await conn.fetchval("SELECT now()")
+        state = await conn.fetchrow("SELECT * FROM engine_state WHERE singleton=true")
+        if confirmation is not None and confirmation["consumed_at"] is not None:
+            if confirmation["action"] != "block_done":
+                text, code = (
+                    "Study state changed. Use /done to choose again.",
+                    "STALE_ACTION",
+                )
+                await conn.execute(
+                    "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
+                    operation_id,
+                    code,
+                )
+                await conn.execute(
+                    "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'done_skip',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                    uuid.uuid4(),
+                    f"operation:{operation_id}:done_skip",
+                    operation_id,
+                    text,
+                )
+                return
+            if (
+                confirmation["actor_id"] != actor_id
+                or confirmation["chat_id"] != chat_id
+                or confirmation["recovery_epoch"] != state["recovery_epoch"]
+            ):
+                text, code = (
+                    "Study state changed. Use /done to choose again.",
+                    "STALE_ACTION",
+                )
+                await conn.execute(
+                    "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
+                    operation_id,
+                    code,
+                )
+                await conn.execute(
+                    "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'done_skip',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                    uuid.uuid4(),
+                    f"operation:{operation_id}:done_skip",
+                    operation_id,
+                    text,
+                )
+            else:
+                text, code = confirmation["result_text"], confirmation["result_code"]
+                await conn.execute(
+                    "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
+                    operation_id,
+                    code,
+                )
+            return
+        candidate = next(
+            (
+                b
+                for b in blocks
+                if confirmation is not None
+                and str(b["block_id"]) == confirmation["target"]
+            ),
+            None,
+        )
+        if (
+            confirmation is None
+            or confirmation["action"] != "block_done"
+            or candidate is None
+            or confirmation["actor_id"] != actor_id
+            or confirmation["chat_id"] != chat_id
+            or confirmation["recovery_epoch"] != state["recovery_epoch"]
+            or confirmation["study_date"] != today
+            or confirmation["expires_at"] <= now
+            or confirmation["state_revision"] != state["state_revision"]
+            or confirmation["queue_revision"] != day["queue_revision"]
+        ):
+            text, code = (
+                "Study state changed. Use /done to choose again.",
+                "STALE_ACTION",
+            )
+            await conn.execute(
+                "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
+                operation_id,
+                code,
+            )
+            await conn.execute(
+                "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'done_skip',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                uuid.uuid4(),
+                f"operation:{operation_id}:done_skip",
+                operation_id,
+                text,
+            )
+            return
+        arguments = [
+            str(candidate["block_id"]),
+            str(day["queue_revision"]),
+            arguments[1],
+        ]
+        token_authorized = True
     target = None
     if arguments:
         try:
@@ -184,12 +620,26 @@ async def handle_block_command(conn, operation_id, command: str, arguments: list
             text = "There are no current pending blocks. Use /today to view your queue."
         code = "BLOCK_SELECTION"
     elif command == "done" and len(arguments) == 1 and target is not None:
-        text = (
-            f"Confirm block {target['block_id']} ({target['topic_id']}) with "
-            f"{target['planned_minutes']} minutes, or send /done {target['block_id']} "
-            f"{day['queue_revision']} {target['planned_minutes']} (0–1440)."
+        state = await conn.fetchrow("SELECT * FROM engine_state WHERE singleton=true")
+        token = await issue_action_confirmation(
+            conn,
+            actor_id,
+            chat_id,
+            "block_done",
+            target["block_id"],
+            today,
+            state["state_revision"],
+            day["queue_revision"],
+            state["recovery_epoch"],
+            target["planned_minutes"],
         )
+        text = f"Confirm {target['topic_id']} with {target['planned_minutes']} minutes, or send /done {token} {target['planned_minutes']} (0–1440)."
         code = "DONE_CONFIRMATION_REQUIRED"
+    elif command == "done" and len(arguments) == 3 and not token_authorized:
+        text, code = (
+            "Use the tokenized confirmation shown in the preview.",
+            "INVALID_ARGUMENTS",
+        )
     elif (
         command == "done"
         and len(arguments) == 3
@@ -291,6 +741,13 @@ async def handle_block_command(conn, operation_id, command: str, arguments: list
                 "Skipped the selected block. No study time was recorded and the queue was not refilled.",
                 "BLOCK_SKIPPED",
             )
+    if confirmation_token is not None and code in ("BLOCK_DONE", "REPLAN_REQUIRED"):
+        await conn.execute(
+            "UPDATE action_confirmations SET consumed_at=now(),result_code=$2,result_text=$3 WHERE token=$1",
+            confirmation_token,
+            code,
+            text,
+        )
     await conn.execute(
         "UPDATE operations SET status='completed',result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),'{result}',jsonb_build_object('code',$2::text)) WHERE operation_id=$1",
         operation_id,
@@ -446,6 +903,7 @@ async def ingest(body: Update):
             "budget",
             "done",
             "skip",
+            "complete_topic",
         )
         budget_value, budget_error = (
             parse_budget(body.payload.arguments)
@@ -517,12 +975,18 @@ async def ingest(body: Update):
                 operation_id,
                 help_text(),
             )
+        elif status == "accepted" and body.payload.command == "complete_topic":
+            await handle_topic_command(
+                conn, operation_id, body.payload.arguments, actor_id, chat_id
+            )
         elif status == "accepted" and body.payload.command in ("done", "skip"):
             await handle_block_command(
                 conn,
                 operation_id,
                 body.payload.command,
                 body.payload.arguments,
+                actor_id,
+                chat_id,
             )
         elif (
             status == "accepted"
@@ -708,7 +1172,14 @@ async def ingest(body: Update):
             configured_bot,
             update_id + 1,
         )
-        return result
+        stored_result = await conn.fetchval(
+            "SELECT result FROM operations WHERE operation_id=$1", operation_id
+        )
+        return (
+            json.loads(stored_result)
+            if isinstance(stored_result, str)
+            else stored_result
+        )
 
 
 @app.post("/v1/deliveries/claim", dependencies=[Depends(service_auth)])
