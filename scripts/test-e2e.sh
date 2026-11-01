@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-if command -v podman >/dev/null 2>&1; then
-  compose=(podman compose)
-elif command -v docker >/dev/null 2>&1; then
+engine_is_usable() {
+  local engine=$1
+  shift
+  command -v "$engine" >/dev/null 2>&1 || return 1
+  "$engine" info >/dev/null 2>&1 || return 1
+  "$@" version >/dev/null 2>&1 || return 1
+  "$@" ls >/dev/null 2>&1
+}
+
+if engine_is_usable docker docker compose; then
   compose=(docker compose)
+elif engine_is_usable podman podman compose; then
+  compose=(podman compose)
 else
-  echo "Podman or Docker Compose is required" >&2
+  cat >&2 <<'EOF'
+A reachable Docker or Podman engine with Compose support is required.
+Docker must pass `docker info` and `docker compose version`; Podman must pass
+`podman info` and `podman compose version`. Start/configure an engine and ensure
+its Compose provider is installed, then retry scripts/test-e2e.sh.
+EOF
   exit 1
 fi
 trap '"${compose[@]}" down -v' EXIT

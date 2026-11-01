@@ -14,4 +14,6 @@ jobs:
           enable-cache: true
       - uses: dtolnay/rust-toolchain@stable
       - name: Test Python, Rust, and full bot-to-Telegram path
-        run: scripts/test-e2e.sh
+        run: |
+          unset DOCKER_HOST DOCKER_CONTEXT
+          scripts/test-e2e.sh
