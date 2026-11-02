@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 import asyncpg
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+from app.calendar import (
+    GoogleCalendarClient,
+    persist_calendar_reminder,
+    sync_calendar_reminders,
+)
 from langgraph.graph import END, START, StateGraph
 
 from app.ranking import (
@@ -23,6 +31,7 @@ from app.ranking import (
 )
 
 JAKARTA = ZoneInfo("Asia/Jakarta")
+logger = logging.getLogger(__name__)
 
 
 class Candidate(TypedDict):
@@ -322,6 +331,9 @@ async def _commit_claimed_job(
         day = await conn.fetchrow(
             "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", today
         )
+        if today != datetime.now(JAKARTA).date():
+            await _expire_old_job(conn, job, day)
+            return
         if job["generation"] != day["requested_generation"]:
             reason = "PLAN_SUPERSEDED"
             text = "A newer planning request replaced this one; use /today to see the current queue."
@@ -333,18 +345,14 @@ async def _commit_claimed_job(
                     reason,
                 )
             for operation_id in operation_ids:
-                await _deliver(conn, operation_id, text)
+                await _deliver(conn, operation_id, text, today)
             await conn.execute(
                 "UPDATE planning_jobs SET status='completed',result=$2::jsonb,lease_until=NULL WHERE job_id=$1",
                 job_id,
                 json.dumps({"reason": "PLAN_SUPERSEDED"}),
             )
             return
-        if (
-            today != datetime.now(JAKARTA).date()
-            or state is None
-            or state["active_curriculum_id"] is None
-        ):
+        if state is None or state["active_curriculum_id"] is None:
             await _no_plan(
                 conn,
                 job,
@@ -421,6 +429,7 @@ async def _commit_claimed_job(
                 block["topic_id"],
                 block["planned_minutes"],
             )
+        await persist_calendar_reminder(conn, today, plan_id, content, blocks)
         lines = render_queue(
             blocks, content, completed, min(day["budget_minutes"], 90) - actual
         )
@@ -444,7 +453,7 @@ async def _commit_claimed_job(
                 str(plan_id),
             )
         for operation_id in operation_ids:
-            await _deliver(conn, operation_id, "\n".join(lines))
+            await _deliver(conn, operation_id, "\n".join(lines), today)
         await conn.execute(
             "UPDATE planning_jobs SET status='completed',result=$2::jsonb,lease_until=NULL WHERE job_id=$1 AND fence=$3",
             job_id,
@@ -462,13 +471,78 @@ async def _job_operations(conn, job) -> list[uuid.UUID]:
     return [row["operation_id"] for row in rows]
 
 
-async def _deliver(conn, operation_id: uuid.UUID, text: str) -> None:
+async def _deliver(
+    conn, operation_id: uuid.UUID, text: str, study_date: date | None = None
+) -> None:
+    source_key = await conn.fetchval(
+        "SELECT source_key FROM operations WHERE operation_id=$1", operation_id
+    )
+    if source_key.startswith("routine:"):
+        study_date = date.fromisoformat(source_key.removeprefix("routine:"))
+        suppressed = await conn.fetchval(
+            "SELECT routine_suppressed FROM study_days WHERE study_date=$1",
+            study_date,
+        )
+        if suppressed:
+            return
+        logical_key = f"routine:{study_date.isoformat()}:telegram"
+        kind = "routine"
+    else:
+        logical_key = f"operation:{operation_id}:today"
+        kind = "today"
     await conn.execute(
-        "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'today',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+        """INSERT INTO deliveries(delivery_id,logical_key,operation_id,study_date,kind,payload,expires_at)
+           VALUES($1,$2,$3,$4,$5,jsonb_build_object('text',$6::text),
+             CASE WHEN $5='routine' THEN (($4::date + 1)::timestamp AT TIME ZONE 'Asia/Jakarta')
+                  ELSE now()+interval '1 hour' END)
+           ON CONFLICT(logical_key) DO NOTHING""",
         uuid.uuid4(),
-        f"operation:{operation_id}:today",
+        logical_key,
         operation_id,
+        study_date,
+        kind,
         text,
+    )
+
+
+async def _expire_old_job(conn, job, day) -> None:
+    """Expire a delayed prior-date job without creating a catch-up delivery."""
+    study_date = job["study_date"]
+    await conn.execute(
+        """UPDATE study_blocks b SET status='cancelled' FROM plans p
+           WHERE b.plan_id=p.plan_id AND p.study_date=$1 AND b.status='pending'""",
+        study_date,
+    )
+    await conn.execute(
+        """UPDATE study_days SET current_plan_id=NULL,state='absent',
+               queue_revision=queue_revision+1 WHERE study_date=$1""",
+        study_date,
+    )
+    await conn.execute(
+        """UPDATE calendar_reminders SET state=CASE WHEN ever_synced THEN 'synced'
+                   ELSE 'cancelled' END,next_check_at=NULL,next_retry_at=NULL,updated_at=now()
+           WHERE study_date=$1 AND state NOT IN ('suppressed','auth_required')""",
+        study_date,
+    )
+    operation_ids = await _job_operations(conn, job)
+    for operation_id in operation_ids:
+        await conn.execute(
+            """UPDATE operations SET status='completed',
+                   result=jsonb_set(jsonb_set(result,'{status}','\"completed\"'::jsonb),
+                                    '{result}',jsonb_build_object('code','PLAN_EXPIRED'))
+               WHERE operation_id=$1""",
+            operation_id,
+        )
+    await conn.execute(
+        "UPDATE planning_jobs SET status='completed',result=$2::jsonb,lease_until=NULL WHERE job_id=$1",
+        job["job_id"],
+        json.dumps({"reason": "PLAN_EXPIRED"}),
+    )
+    await conn.execute(
+        """UPDATE deliveries SET status='failed',lease_until=NULL
+           WHERE kind IN ('today','routine') AND study_date=$1
+             AND status IN ('pending','leased')""",
+        study_date,
     )
 
 
@@ -499,7 +573,7 @@ async def _no_plan(conn, job, reason: str, day) -> None:
             reason,
         )
     for operation_id in operation_ids:
-        await _deliver(conn, operation_id, text)
+        await _deliver(conn, operation_id, text, job["study_date"])
     await conn.execute(
         "UPDATE planning_jobs SET status='completed',result=$2::jsonb,lease_until=NULL WHERE job_id=$1",
         job["job_id"],
@@ -542,17 +616,176 @@ async def next_job(pool: asyncpg.Pool):
         )
 
 
+async def _current_queue_for_routine(conn, study_date: date, day) -> str | None:
+    plan = await conn.fetchrow(
+        """SELECT v.content FROM plans p
+           JOIN curriculum_versions v ON v.curriculum_id=p.curriculum_id
+           JOIN engine_state s ON s.singleton=true AND s.active_curriculum_id=p.curriculum_id
+             AND s.state_revision=p.state_revision
+           WHERE p.plan_id=$1 AND p.study_date=$2 AND v.status='approved'""",
+        day["current_plan_id"],
+        study_date,
+    )
+    if plan is None:
+        return None
+    content = plan["content"]
+    if isinstance(content, str):
+        content = json.loads(content)
+    blocks = await conn.fetch(
+        "SELECT topic_id,planned_minutes FROM study_blocks WHERE plan_id=$1 AND status='pending' ORDER BY position",
+        day["current_plan_id"],
+    )
+    if not blocks:
+        return ""
+    await persist_calendar_reminder(
+        conn, study_date, day["current_plan_id"], content, blocks
+    )
+    completed = {
+        row["topic_id"]
+        for row in await conn.fetch("SELECT topic_id FROM topic_progress WHERE completed=true")
+    }
+    actual = await conn.fetchval(
+        "SELECT COALESCE(sum(actual_minutes),0)::int FROM study_sessions WHERE study_date=$1",
+        study_date,
+    )
+    lines = render_queue(
+        blocks, content, completed, min(day["budget_minutes"], 90) - actual
+    )
+    return "\n".join(lines) if lines else None
+
+
+async def run_routine_tick(pool: asyncpg.Pool, now: datetime | None = None) -> bool:
+    """Durably deliver today's plan once its Jakarta routine time arrives."""
+    now = now or datetime.now(JAKARTA)
+    if now.tzinfo is None:
+        raise ValueError("routine tick requires a timezone-aware datetime")
+    local_now = now.astimezone(JAKARTA)
+    if (local_now.hour, local_now.minute) < (17, 0):
+        return False
+
+    study_date = local_now.date()
+    source_key = f"routine:{study_date.isoformat()}"
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(0,$1::date - DATE '2000-01-01')",
+            study_date,
+        )
+        await conn.fetch("SELECT job_id FROM planning_jobs WHERE study_date=$1 AND status IN ('pending','running') FOR UPDATE", study_date)
+        await conn.fetchrow("SELECT singleton FROM engine_state WHERE singleton=true FOR UPDATE")
+        await conn.execute(
+            "INSERT INTO study_days(study_date) VALUES($1) ON CONFLICT DO NOTHING",
+            study_date,
+        )
+        day = await conn.fetchrow(
+            "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", study_date
+        )
+        existing = await conn.fetchval(
+            "SELECT operation_id FROM operations WHERE source_key=$1", source_key
+        )
+        if existing is not None:
+            return True
+
+        active_job_id = await conn.fetchval(
+            """SELECT job_id FROM planning_jobs WHERE study_date=$1
+               AND status IN ('pending','running') FOR UPDATE""",
+            study_date,
+        )
+        operation_id = uuid.uuid4()
+        await conn.execute(
+            """INSERT INTO operations(operation_id,source_key,request_hash,status,result)
+               VALUES($1,$2,$3,'accepted',$4::jsonb)""",
+            operation_id,
+            source_key,
+            source_key,
+            json.dumps({"status": "accepted", "kind": "routine"}),
+        )
+        if day["budget_minutes"] == 0:
+            await conn.execute(
+                "UPDATE operations SET status='completed',result=$2::jsonb WHERE operation_id=$1",
+                operation_id,
+                json.dumps({"status": "completed", "kind": "routine", "result": {"code": "REST_DAY"}}),
+            )
+            return True
+
+        if day["state"] == "valid" and active_job_id is None:
+            text = await _current_queue_for_routine(conn, study_date, day)
+            if text == "":
+                await conn.execute(
+                    "UPDATE operations SET status='completed',result=$2::jsonb WHERE operation_id=$1",
+                    operation_id,
+                    json.dumps({"status": "completed", "kind": "routine", "result": {"code": "NO_PENDING_BLOCKS"}}),
+                )
+                return True
+            if text is not None:
+                await conn.execute(
+                    "UPDATE operations SET status='completed',result=$2::jsonb WHERE operation_id=$1",
+                    operation_id,
+                    json.dumps({"status": "completed", "kind": "routine", "result": {"code": "PLAN_READY", "plan_id": str(day['current_plan_id'])}}),
+                )
+                await _deliver(conn, operation_id, text, study_date)
+                return True
+            await conn.execute(
+                "UPDATE study_days SET state='replan_required' WHERE study_date=$1",
+                study_date,
+            )
+
+        if active_job_id is None:
+            generation = day["requested_generation"] + 1
+            await conn.execute(
+                "UPDATE study_days SET requested_generation=$2 WHERE study_date=$1",
+                study_date,
+                generation,
+            )
+            active_job_id = uuid.uuid4()
+            await conn.execute(
+                """INSERT INTO planning_jobs(job_id,operation_id,study_date,generation)
+                   VALUES($1,$2,$3,$4)""",
+                active_job_id,
+                operation_id,
+                study_date,
+                generation,
+            )
+        else:
+            await conn.execute(
+                """INSERT INTO planning_job_operations(operation_id,job_id)
+                   VALUES($1,$2)""",
+                operation_id,
+                active_job_id,
+            )
+        return True
+
+
 async def run_worker() -> None:
     pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
     owner = uuid.uuid4()
     checkpoint_conn = await __import__("psycopg").AsyncConnection.connect(
         os.environ["DATABASE_URL"], autocommit=True
     )
+    calendar_client = None
     try:
         # Checkpoint tables are provisioned by app.migrate using migration credentials.
         saver = AsyncPostgresSaver(checkpoint_conn)
         graph = build_graph(saver, pool, owner)
+        routine_checked_date = None
+        calendar_path = os.environ.get("GOOGLE_CALENDAR_CREDENTIALS_FILE")
+        calendar_checked_minute = None
         while True:
+            now = datetime.now(JAKARTA)
+            if routine_checked_date != now.date() and await run_routine_tick(pool, now):
+                routine_checked_date = now.date()
+            if calendar_path and Path(calendar_path).is_file():
+                if calendar_client is None:
+                    calendar_client = GoogleCalendarClient(calendar_path)
+                current_minute = now.replace(second=0, microsecond=0)
+                if current_minute != calendar_checked_minute:
+                    try:
+                        await sync_calendar_reminders(pool, calendar_client, now)
+                    except Exception as exc:
+                        logger.warning("Calendar sync tick failed (%s)", type(exc).__name__)
+                    calendar_checked_minute = current_minute
+            elif calendar_client is not None:
+                await calendar_client.close()
+                calendar_client = None
             job_id = await next_job(pool)
             if job_id is None:
                 await asyncio.sleep(1)
@@ -560,7 +793,10 @@ async def run_worker() -> None:
             await graph.ainvoke(
                 {"job_id": str(job_id)}, {"configurable": {"thread_id": str(job_id)}}
             )
+            calendar_checked_minute = None
     finally:
+        if calendar_client is not None:
+            await calendar_client.close()
         await checkpoint_conn.close()
         await pool.close()
 

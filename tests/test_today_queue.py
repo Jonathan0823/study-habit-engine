@@ -11,9 +11,16 @@ import pytest
 from fastapi.testclient import TestClient
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+from app.calendar import (
+    CalendarAuthRequired,
+    CalendarNotFound,
+    CalendarTransientError,
+    persist_calendar_reminder,
+    sync_calendar_reminders,
+)
 from app.db import apply_schema
 from app.main import app
-from app.planning import build_graph, next_job, process_job
+from app.planning import build_graph, next_job, process_job, run_routine_tick
 
 
 @pytest.fixture
@@ -953,3 +960,590 @@ def test_ai_budget_falls_back_without_an_extra_dispatch(
         ("a", 30),
         ("a", 30),
     ]
+
+
+def test_routine_delivery_creates_today_plan_once_when_due(today_client):
+    study_date = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+
+    async def run_ticks_and_plan():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            before_due = await run_routine_tick(pool, due.replace(hour=16, minute=59))
+            before_job = await next_job(pool)
+            await asyncio.gather(*(run_routine_tick(pool, due) for _ in range(4)))
+            scheduled_job = await next_job(pool)
+            await run_routine_tick(pool, due)
+            repeated_job = await next_job(pool)
+            assert scheduled_job is not None
+            assert repeated_job == scheduled_job
+            await process_job(pool, scheduled_job, uuid.uuid4())
+            after_commit = await next_job(pool)
+            return before_due, before_job, after_commit
+        finally:
+            await pool.close()
+
+    before_due, before_job, after_commit = asyncio.run(run_ticks_and_plan())
+    assert before_due is False
+    assert before_job is None
+    assert after_commit is None
+
+    delivery = today_client.post(
+        "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
+    )
+    assert delivery.status_code == 200
+    assert delivery.json()["text"].startswith("Today's study queue:")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_text"),
+    [
+        ("no_fit", "Eligible topics exist, but no study block fits the available time"),
+        ("blocked", "No eligible study topics are available right now."),
+    ],
+)
+def test_routine_uses_approved_explanations_when_no_plan_fits(
+    today_client, case, expected_text
+):
+    study_date = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+
+    async def prepare_explanation():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            if case == "no_fit":
+                await conn.execute(
+                    "INSERT INTO study_days(study_date,budget_minutes) VALUES($1,5)",
+                    study_date,
+                )
+            else:
+                curriculum_id = await conn.fetchval(
+                    "SELECT active_curriculum_id FROM engine_state WHERE singleton=true"
+                )
+                content = await conn.fetchval(
+                    "SELECT content FROM curriculum_versions WHERE curriculum_id=$1",
+                    curriculum_id,
+                )
+                if isinstance(content, str):
+                    content = json.loads(content)
+                for topic in content["topics"]:
+                    await conn.execute(
+                        "INSERT INTO topic_progress(topic_id,completed) VALUES($1,true)",
+                        topic["topic_id"],
+                    )
+        finally:
+            await conn.close()
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            await run_routine_tick(pool, due)
+            job_id = await next_job(pool)
+            assert job_id is not None
+            await process_job(pool, job_id, uuid.uuid4())
+        finally:
+            await pool.close()
+
+    asyncio.run(prepare_explanation())
+    delivery = today_client.post(
+        "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
+    )
+    assert delivery.status_code == 200
+    assert delivery.json()["text"].startswith(expected_text)
+
+
+def test_routine_rest_day_does_not_create_a_plan_or_telegram_delivery(today_client):
+    study_date = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+
+    async def set_rest_day_and_tick():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO study_days(study_date,budget_minutes) VALUES($1,0)",
+                study_date,
+            )
+        finally:
+            await conn.close()
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            await run_routine_tick(pool, due)
+            return await next_job(pool)
+        finally:
+            await pool.close()
+
+    assert asyncio.run(set_rest_day_and_tick()) is None
+    response = today_client.post(
+        "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
+    )
+    assert response.status_code == 204
+
+
+def _seed_calendar_plan(today_client):
+    async def seed():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            study_date = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+            async with pool.acquire() as conn, conn.transaction():
+                state = await conn.fetchrow(
+                    "SELECT active_curriculum_id,state_revision FROM engine_state WHERE singleton=true"
+                )
+                curriculum = await conn.fetchrow(
+                    "SELECT content FROM curriculum_versions WHERE curriculum_id=$1",
+                    state["active_curriculum_id"],
+                )
+                content = curriculum["content"]
+                if isinstance(content, str):
+                    content = json.loads(content)
+                topic = content["topics"][0]
+                plan_id = uuid.uuid4()
+                await conn.execute(
+                    "INSERT INTO study_days(study_date,requested_generation) VALUES($1,1)",
+                    study_date,
+                )
+                await conn.execute(
+                    """INSERT INTO plans(plan_id,study_date,curriculum_id,generation,state_revision,queue_revision)
+                       VALUES($1,$2,$3,1,$4,1)""",
+                    plan_id,
+                    study_date,
+                    state["active_curriculum_id"],
+                    state["state_revision"],
+                )
+                await conn.execute(
+                    """INSERT INTO study_blocks(block_id,plan_id,position,topic_id,planned_minutes)
+                       VALUES($1,$2,0,$3,25)""",
+                    uuid.uuid4(),
+                    plan_id,
+                    topic["topic_id"],
+                )
+                await conn.execute(
+                    """UPDATE study_days SET state='valid',current_plan_id=$2,queue_revision=1
+                       WHERE study_date=$1""",
+                    study_date,
+                    plan_id,
+                )
+                await persist_calendar_reminder(
+                    conn,
+                    study_date,
+                    plan_id,
+                    content,
+                    [{"topic_id": topic["topic_id"], "planned_minutes": 25}],
+                )
+            return study_date
+        finally:
+            await pool.close()
+
+    return asyncio.run(seed())
+
+
+class _FakeCalendar:
+    def __init__(self):
+        self.events = {}
+        self.calls = []
+
+    async def request(self, method, event_id=None, *, body=None):
+        self.calls.append((method, event_id, body))
+        if method == "GET":
+            if event_id not in self.events:
+                raise CalendarNotFound("missing")
+            return self.events[event_id]
+        if method == "POST":
+            self.events[body["id"]] = dict(body)
+            return self.events[body["id"]]
+        if method == "PATCH":
+            self.events[event_id].update(body)
+            return self.events[event_id]
+        if method == "DELETE":
+            self.events.pop(event_id, None)
+            return None
+        raise AssertionError(method)
+
+
+def test_routine_delivery_reuses_valid_queue_without_replanning(today_client):
+    async def setup_cursor():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO telegram_cursor(bot_id,next_offset,poller_owner,fence,lease_until) VALUES(12345,0,$1,1,now()+interval '1 minute')",
+                uuid.uuid4(),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup_cursor())
+    replan = today_client.post(
+        "/v1/telegram/updates",
+        headers={"Authorization": "Bearer bot-secret"},
+        json={
+            **_today_payload(900000104),
+            "payload": {"kind": "command", "command": "replan", "arguments": []},
+        },
+    )
+    assert replan.status_code == 200
+
+    study_date = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+
+    async def prepare_and_send_user_replan():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            job_id = await next_job(pool)
+            assert job_id is not None
+            await process_job(pool, job_id, uuid.uuid4())
+        finally:
+            await pool.close()
+
+    asyncio.run(prepare_and_send_user_replan())
+
+    async def read_calendar_intent():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            return await conn.fetchrow(
+                "SELECT topics FROM calendar_reminders WHERE study_date=$1",
+                study_date,
+            )
+        finally:
+            await conn.close()
+
+    calendar_intent = asyncio.run(read_calendar_intent())
+    assert calendar_intent is not None
+    calendar_topics = calendar_intent["topics"]
+    if isinstance(calendar_topics, str):
+        calendar_topics = json.loads(calendar_topics)
+    assert calendar_topics
+    assert all(set(topic) == {"title", "planned_minutes"} for topic in calendar_topics)
+
+    user_delivery = today_client.post(
+        "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
+    )
+    assert user_delivery.status_code == 200
+    sent = today_client.post(
+        f"/v1/deliveries/{user_delivery.json()['delivery_id']}/result",
+        headers={"Authorization": "Bearer bot-secret"},
+        json={
+            "fence": user_delivery.json()["fence"],
+            "outcome": "sent",
+            "telegram_receipt": "replan-message-1",
+        },
+    )
+    assert sent.status_code == 200
+
+    async def tick_existing_plan():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            await asyncio.gather(*(run_routine_tick(pool, due) for _ in range(4)))
+            return await next_job(pool)
+        finally:
+            await pool.close()
+
+    assert asyncio.run(tick_existing_plan()) is None
+    routine_delivery = today_client.post(
+        "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
+    )
+    assert routine_delivery.status_code == 200
+    assert routine_delivery.json()["text"].startswith("Today's study queue:")
+
+    fake_calendar = _FakeCalendar()
+
+    async def sync_replan_and_check_manual_deletion():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            await sync_calendar_reminders(pool, fake_calendar, due - timedelta(minutes=5))
+            event_id, initial = next(iter(fake_calendar.events.items()))
+            async with pool.acquire() as conn, conn.transaction():
+                current = await conn.fetchrow(
+                    """SELECT p.plan_id,p.curriculum_id,v.content,b.topic_id
+                       FROM study_days d JOIN plans p ON p.plan_id=d.current_plan_id
+                       JOIN curriculum_versions v ON v.curriculum_id=p.curriculum_id
+                       JOIN study_blocks b ON b.plan_id=p.plan_id AND b.status='pending'
+                       WHERE d.study_date=$1 ORDER BY b.position LIMIT 1""",
+                    study_date,
+                )
+                await conn.execute(
+                    "UPDATE study_blocks SET planned_minutes=30 WHERE plan_id=$1 AND topic_id=$2 AND status='pending'",
+                    current["plan_id"],
+                    current["topic_id"],
+                )
+                await persist_calendar_reminder(
+                    conn,
+                    study_date,
+                    current["plan_id"],
+                    current["content"],
+                    [{"topic_id": current["topic_id"], "planned_minutes": 30}],
+                )
+            await sync_calendar_reminders(
+                pool, fake_calendar, due - timedelta(minutes=4)
+            )
+            updated = fake_calendar.events[event_id]
+            fake_calendar.events.clear()
+            await sync_calendar_reminders(pool, fake_calendar, due)
+            state = await pool.fetchval(
+                "SELECT state FROM calendar_reminders WHERE study_date=$1", study_date
+            )
+            return initial, updated, state
+        finally:
+            await pool.close()
+
+    initial_event, updated_event, calendar_state = asyncio.run(
+        sync_replan_and_check_manual_deletion()
+    )
+    assert initial_event["visibility"] == "private"
+    assert "resources" not in initial_event["description"]
+    assert "https://" not in initial_event["description"]
+    assert "30 min" in updated_event["description"]
+    assert len([call for call in fake_calendar.calls if call[0] == "POST"]) == 1
+    assert len([call for call in fake_calendar.calls if call[0] == "PATCH"]) == 1
+    assert calendar_state == "suppressed"
+
+
+def test_stale_planning_job_expires_without_a_catchup_delivery(today_client):
+    async def setup_cursor():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO telegram_cursor(bot_id,next_offset,poller_owner,fence,lease_until) VALUES(12345,0,$1,1,now()+interval '1 minute')",
+                uuid.uuid4(),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup_cursor())
+    accepted = today_client.post(
+        "/v1/telegram/updates",
+        headers={"Authorization": "Bearer bot-secret"},
+        json={
+            **_today_payload(900000107),
+            "payload": {"kind": "command", "command": "replan", "arguments": []},
+        },
+    )
+    assert accepted.status_code == 200
+    study_date = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+    stale_date = study_date - timedelta(days=1)
+
+    async def expire_stale_job():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            job_id = await next_job(pool)
+            assert job_id is not None
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO study_days(study_date,requested_generation) VALUES($1,1)",
+                    stale_date,
+                )
+                await conn.execute(
+                    "UPDATE planning_jobs SET study_date=$2 WHERE job_id=$1",
+                    job_id,
+                    stale_date,
+                )
+            await process_job(pool, job_id, uuid.uuid4())
+            async with pool.acquire() as conn:
+                return await conn.fetchval(
+                    "SELECT count(*) FROM deliveries WHERE study_date=$1", stale_date
+                )
+        finally:
+            await pool.close()
+
+    assert asyncio.run(expire_stale_job()) == 0
+    claim = today_client.post(
+        "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
+    )
+    assert claim.status_code == 204
+
+
+def test_early_today_delivery_suppresses_duplicate_routine_telegram(today_client):
+    async def setup_cursor():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO telegram_cursor(bot_id,next_offset,poller_owner,fence,lease_until) VALUES(12345,0,$1,1,now()+interval '1 minute')",
+                uuid.uuid4(),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup_cursor())
+    today = today_client.post(
+        "/v1/telegram/updates",
+        headers={"Authorization": "Bearer bot-secret"},
+        json=_today_payload(900000105),
+    )
+    assert today.status_code == 200
+
+    async def process_today():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            job_id = await next_job(pool)
+            assert job_id is not None
+            await process_job(pool, job_id, uuid.uuid4())
+        finally:
+            await pool.close()
+
+    asyncio.run(process_today())
+    user_delivery = today_client.post(
+        "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
+    )
+    assert user_delivery.status_code == 200
+    sent = today_client.post(
+        f"/v1/deliveries/{user_delivery.json()['delivery_id']}/result",
+        headers={"Authorization": "Bearer bot-secret"},
+        json={
+            "fence": user_delivery.json()["fence"],
+            "outcome": "sent",
+            "telegram_receipt": "early-today-message-1",
+        },
+    )
+    assert sent.status_code == 200
+
+    due = datetime.combine(
+        datetime.now(ZoneInfo("Asia/Jakarta")).date(),
+        datetime.min.time(),
+        ZoneInfo("Asia/Jakarta"),
+    ).replace(hour=17)
+
+    async def tick_routine():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            await run_routine_tick(pool, due)
+            await run_routine_tick(pool, due)
+            return await next_job(pool)
+        finally:
+            await pool.close()
+
+    assert asyncio.run(tick_routine()) is None
+    duplicate = today_client.post(
+        "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
+    )
+    assert duplicate.status_code == 204
+
+
+def test_calendar_event_is_removed_when_queue_finishes_before_17(today_client):
+    study_date = _seed_calendar_plan(today_client)
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+    fake_calendar = _FakeCalendar()
+
+    async def finish_and_sync():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            await sync_calendar_reminders(pool, fake_calendar, due - timedelta(minutes=5))
+            event_id = next(iter(fake_calendar.events))
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE study_blocks SET status='done' WHERE plan_id=(SELECT current_plan_id FROM study_days WHERE study_date=$1)",
+                    study_date,
+                )
+            await sync_calendar_reminders(
+                pool, fake_calendar, due - timedelta(minutes=4)
+            )
+            state = await pool.fetchval(
+                "SELECT state FROM calendar_reminders WHERE study_date=$1", study_date
+            )
+            return state, event_id in fake_calendar.events
+        finally:
+            await pool.close()
+
+    state, event_remains = asyncio.run(finish_and_sync())
+    assert state == "cancelled"
+    assert event_remains is False
+    assert any(call[0] == "DELETE" for call in fake_calendar.calls)
+
+
+def test_calendar_transient_failures_stop_after_one_hour(today_client):
+    study_date = _seed_calendar_plan(today_client)
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+    first_attempt = due - timedelta(minutes=5)
+    retry_attempt = first_attempt + timedelta(minutes=2)
+
+    class FailingCalendar:
+        async def request(self, method, event_id=None, *, body=None):
+            if method == "GET":
+                raise CalendarNotFound("not created")
+            raise CalendarTransientError("temporary outage")
+
+    async def try_twice():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            client = FailingCalendar()
+            await sync_calendar_reminders(pool, client, first_attempt)
+            async with pool.acquire() as conn:
+                first = await conn.fetchrow(
+                    "SELECT state,retry_until,next_retry_at,attempts FROM calendar_reminders WHERE study_date=$1",
+                    study_date,
+                )
+                await conn.execute(
+                    "UPDATE calendar_reminders SET retry_until=$2,next_retry_at=$2 WHERE study_date=$1",
+                    study_date,
+                    retry_attempt - timedelta(seconds=1),
+                )
+            await sync_calendar_reminders(pool, client, retry_attempt)
+            async with pool.acquire() as conn:
+                final = await conn.fetchrow(
+                    "SELECT state,last_error_code,attempts FROM calendar_reminders WHERE study_date=$1",
+                    study_date,
+                )
+            return first, final
+        finally:
+            await pool.close()
+
+    first, final = asyncio.run(try_twice())
+    assert first["state"] == "pending"
+    assert first["retry_until"] is not None
+    assert first["next_retry_at"] is not None
+    assert first["attempts"] == 1
+    assert final["state"] == "failed"
+    assert final["last_error_code"] == "RETRY_EXHAUSTED"
+    assert final["attempts"] == 2
+
+
+def test_calendar_reauthorization_resumes_only_after_secret_file_changes(today_client, tmp_path):
+    study_date = _seed_calendar_plan(today_client)
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+    credentials_file = tmp_path / "calendar.json"
+
+    class ReconnectableCalendar(_FakeCalendar):
+        def __init__(self):
+            super().__init__()
+            self.credentials_file = credentials_file
+            self.authorized = False
+
+        async def request(self, method, event_id=None, *, body=None):
+            if not self.authorized:
+                raise CalendarAuthRequired("reconnect required")
+            return await super().request(method, event_id, body=body)
+
+    async def reconnect():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        client = ReconnectableCalendar()
+        try:
+            await sync_calendar_reminders(pool, client, due - timedelta(minutes=5))
+            async with pool.acquire() as conn:
+                first_state = await conn.fetchval(
+                    "SELECT state FROM calendar_reminders WHERE study_date=$1", study_date
+                )
+            credentials_file.write_text('{"client_id":"private"}')
+            credentials_file.chmod(0o600)
+            client.authorized = True
+            await sync_calendar_reminders(pool, client, due - timedelta(minutes=4))
+            async with pool.acquire() as conn:
+                final_state = await conn.fetchval(
+                    "SELECT state FROM calendar_reminders WHERE study_date=$1", study_date
+                )
+            return first_state, final_state, client.calls
+        finally:
+            await pool.close()
+
+    first_state, final_state, calls = asyncio.run(reconnect())
+    assert first_state == "auth_required"
+    assert final_state == "synced"
+    assert [call[0] for call in calls] == ["GET", "POST"]

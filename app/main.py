@@ -1849,13 +1849,18 @@ async def ingest(body: Update):
                     operation_id,
                 )
                 await conn.execute(
-                    "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'today',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                    "INSERT INTO deliveries(delivery_id,logical_key,operation_id,study_date,kind,payload) VALUES($1,$2,$3,$4,'today',jsonb_build_object('text',$5::text)) ON CONFLICT(logical_key) DO NOTHING",
                     uuid.uuid4(),
                     f"operation:{operation_id}:today",
                     operation_id,
+                    study_date,
                     "Today's queue needs to be refreshed. Use /replan to create a replacement queue.",
                 )
             else:
+                await conn.execute(
+                    "UPDATE study_days SET routine_suppressed=true WHERE study_date=$1",
+                    study_date,
+                )
                 if day["state"] == "valid" and day["current_plan_id"] is not None:
                     plan = await conn.fetchrow(
                         """SELECT p.curriculum_id,p.state_revision,v.status,v.content
@@ -1904,10 +1909,11 @@ async def ingest(body: Update):
                             str(day["current_plan_id"]),
                         )
                         await conn.execute(
-                            "INSERT INTO deliveries(delivery_id,logical_key,operation_id,kind,payload) VALUES($1,$2,$3,'today',jsonb_build_object('text',$4::text)) ON CONFLICT(logical_key) DO NOTHING",
+                            "INSERT INTO deliveries(delivery_id,logical_key,operation_id,study_date,kind,payload) VALUES($1,$2,$3,$4,'today',jsonb_build_object('text',$5::text)) ON CONFLICT(logical_key) DO NOTHING",
                             uuid.uuid4(),
                             f"operation:{operation_id}:today",
                             operation_id,
+                            study_date,
                             "\n".join(display_lines),
                         )
                     else:
@@ -1968,11 +1974,18 @@ async def claim_delivery():
     db = await get_pool()
     async with db.acquire() as conn, conn.transaction():
         await conn.execute(
-            "UPDATE deliveries SET status='failed',lease_until=NULL WHERE status IN ('pending','leased') AND expires_at <= now()"
+            """UPDATE deliveries SET status='failed',lease_until=NULL
+               WHERE status IN ('pending','leased') AND (
+                   expires_at <= now() OR
+                   (kind IN ('today','routine') AND study_date < (now() AT TIME ZONE 'Asia/Jakarta')::date)
+               )"""
         )
         row = await conn.fetchrow(
             """SELECT d.delivery_id,d.operation_id,d.payload,d.fence FROM deliveries d
-               WHERE d.expires_at > now() AND (d.status='pending' AND d.next_attempt_at <= now()
+               WHERE d.expires_at > now()
+                 AND (d.study_date IS NULL OR d.kind NOT IN ('today','routine')
+                      OR d.study_date >= (now() AT TIME ZONE 'Asia/Jakarta')::date)
+                 AND (d.status='pending' AND d.next_attempt_at <= now()
                   OR d.status='leased' AND d.lease_until < now())
                ORDER BY d.created_at FOR UPDATE SKIP LOCKED LIMIT 1"""
         )

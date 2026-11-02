@@ -109,8 +109,10 @@ CREATE TABLE IF NOT EXISTS study_days (
     queue_revision bigint NOT NULL DEFAULT 0,
     state text NOT NULL DEFAULT 'absent' CHECK (state IN ('absent','valid','replan_required')),
     current_plan_id uuid,
-    requested_generation bigint NOT NULL DEFAULT 0
+    requested_generation bigint NOT NULL DEFAULT 0,
+    routine_suppressed boolean NOT NULL DEFAULT false
 );
+ALTER TABLE study_days ADD COLUMN IF NOT EXISTS routine_suppressed boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS action_confirmations (
     token text PRIMARY KEY CHECK (octet_length(token) <= 48),
@@ -198,6 +200,26 @@ CREATE TABLE IF NOT EXISTS plans (
     UNIQUE (study_date, generation)
 );
 
+CREATE TABLE IF NOT EXISTS calendar_reminders (
+    study_date date PRIMARY KEY REFERENCES study_days(study_date),
+    plan_id uuid NOT NULL REFERENCES plans(plan_id),
+    event_id text NOT NULL,
+    topics jsonb NOT NULL CHECK (jsonb_typeof(topics)='array'),
+    payload_hash text NOT NULL,
+    synced_payload_hash text,
+    state text NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending','synced','cancelled','suppressed','auth_required','failed')),
+    ever_synced boolean NOT NULL DEFAULT false,
+    first_attempt_at timestamptz,
+    retry_until timestamptz,
+    next_retry_at timestamptz,
+    next_check_at timestamptz,
+    attempts integer NOT NULL DEFAULT 0,
+    last_error_code text,
+    auth_file_mtime double precision,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -270,6 +292,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id uuid PRIMARY KEY,
     logical_key text UNIQUE NOT NULL,
     operation_id uuid NOT NULL REFERENCES operations(operation_id),
+    study_date date REFERENCES study_days(study_date),
     kind text NOT NULL,
     payload jsonb NOT NULL,
     status text NOT NULL CHECK (status IN ('pending', 'leased', 'sent', 'failed')) DEFAULT 'pending',
@@ -281,3 +304,5 @@ CREATE TABLE IF NOT EXISTS deliveries (
     telegram_receipt text,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS study_date date REFERENCES study_days(study_date);
+CREATE INDEX IF NOT EXISTS deliveries_study_date ON deliveries(study_date,status);
