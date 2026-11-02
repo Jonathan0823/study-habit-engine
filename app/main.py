@@ -10,20 +10,31 @@ from typing import Annotated, Literal
 import asyncpg
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.commands import COMMANDS, help_text
 from app.dependencies import get_pool as shared_get_pool
 from app.dependencies import required_config, set_pool
+from app.plan_approval import decide_plan_proposal, parse_proposal_id
+from app.plan_intake import accept_learning_plan_text, begin_learning_plan
 
 
 class Payload(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["command"]
-    command: str = Field(min_length=1, max_length=32)
+    kind: Literal["command", "text"]
+    command: str = Field(default="", max_length=32)
     arguments: list[Annotated[str, Field(max_length=128)]] = Field(
-        default_factory=list, max_length=8
+        default_factory=list, max_length=32
     )
+    text: str | None = Field(default=None, min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_kind_fields(self):
+        if self.kind == "command" and (not self.command or self.text is not None):
+            raise ValueError("command payload requires a command and no text")
+        if self.kind == "text" and (not self.text or self.command or self.arguments):
+            raise ValueError("text payload requires text and no command arguments")
+        return self
 
 
 class Update(BaseModel):
@@ -1675,8 +1686,11 @@ async def ingest(body: Update):
             and chat_id == int(required_config("TELEGRAM_PRIVATE_CHAT_ID"))
             and actor_id == chat_id
         )
-        defined_command = any(name == body.payload.command for name, _, _ in COMMANDS)
-        implemented_command = body.payload.command in (
+        is_text = body.payload.kind == "text"
+        defined_command = is_text or any(
+            name == body.payload.command for name, _, _ in COMMANDS
+        )
+        implemented_command = is_text or body.payload.command in (
             "help",
             "today",
             "replan",
@@ -1685,6 +1699,14 @@ async def ingest(body: Update):
             "skip",
             "complete_topic",
             "progress",
+            "learn",
+            "approve",
+            "reject",
+        )
+        plan_proposal_id = (
+            parse_proposal_id(body.payload.arguments)
+            if body.payload.command in ("approve", "reject")
+            else None
         )
         budget_value, budget_error = (
             parse_budget(body.payload.arguments)
@@ -1712,6 +1734,9 @@ async def ingest(body: Update):
         result_code = (
             "UNAUTHORIZED"
             if not authorized
+            else "PROPOSAL_ID_REQUIRED"
+            if body.payload.command in ("approve", "reject")
+            and plan_proposal_id is None
             else "UNSUPPORTED_COMMAND"
             if not defined_command
             else "NOT_IMPLEMENTED"
@@ -1724,6 +1749,14 @@ async def ingest(body: Update):
             and actual_error is not None
             else "HELP_READY"
             if body.payload.command == "help"
+            else "LEARNING_PLAN_STARTED"
+            if body.payload.command == "learn"
+            else "PLAN_APPROVAL_ACCEPTED"
+            if body.payload.command == "approve"
+            else "PLAN_REJECTION_ACCEPTED"
+            if body.payload.command == "reject"
+            else "TEXT_RECEIVED"
+            if is_text
             else "PLAN_ACCEPTED"
         )
         result = {
@@ -1755,6 +1788,26 @@ async def ingest(body: Update):
                 f"operation:{operation_id}:help",
                 operation_id,
                 help_text(),
+            )
+        elif status == "accepted" and body.payload.command == "learn":
+            initial_goal = " ".join(body.payload.arguments).strip()
+            await begin_learning_plan(
+                conn, operation_id, actor_id, chat_id, initial_goal
+            )
+        elif status == "accepted" and body.payload.command in ("approve", "reject"):
+            await decide_plan_proposal(
+                conn,
+                operation_id,
+                plan_proposal_id,
+                approve=body.payload.command == "approve",
+            )
+        elif status == "accepted" and is_text:
+            await accept_learning_plan_text(
+                conn,
+                operation_id,
+                actor_id,
+                chat_id,
+                body.payload.text or "",
             )
         elif status == "accepted" and body.payload.command == "complete_topic":
             await handle_topic_command(

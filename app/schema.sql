@@ -41,6 +41,43 @@ CREATE TRIGGER learning_plan_proposal_content_immutable
     BEFORE UPDATE ON learning_plan_proposals
     FOR EACH ROW EXECUTE FUNCTION prevent_learning_plan_proposal_content_mutation();
 
+CREATE TABLE IF NOT EXISTS learning_plan_sessions (
+    actor_id bigint NOT NULL,
+    chat_id bigint NOT NULL,
+    started_by_operation_id uuid NOT NULL REFERENCES operations(operation_id),
+    phase text NOT NULL CHECK (phase IN ('awaiting_goal','awaiting_weekly_minutes')),
+    goal text CHECK (goal IS NULL OR length(btrim(goal)) BETWEEN 1 AND 2000),
+    expires_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (actor_id, chat_id),
+    CHECK (phase <> 'awaiting_weekly_minutes' OR goal IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS learning_plan_jobs (
+    job_id uuid PRIMARY KEY,
+    operation_id uuid NOT NULL UNIQUE REFERENCES operations(operation_id),
+    goal text NOT NULL CHECK (length(btrim(goal)) BETWEEN 1 AND 2000),
+    learner_context jsonb NOT NULL,
+    status text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','running','completed','failed','expired')),
+    lease_owner uuid,
+    fence bigint NOT NULL DEFAULT 0,
+    lease_until timestamptz,
+    attempts integer NOT NULL DEFAULT 0,
+    proposal_id uuid REFERENCES learning_plan_proposals(proposal_id),
+    error_code text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    completed_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS learning_plan_jobs_claimable
+    ON learning_plan_jobs(status,lease_until,created_at);
+
+CREATE TABLE IF NOT EXISTS tavily_search_usage (
+    month_start date PRIMARY KEY CHECK (extract(day FROM month_start) = 1),
+    credits_reserved integer NOT NULL DEFAULT 0 CHECK (credits_reserved BETWEEN 0 AND 1000),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS telegram_ingestion (
     bot_id bigint NOT NULL,
     update_id bigint NOT NULL,
@@ -86,6 +123,9 @@ CREATE TABLE IF NOT EXISTS curriculum_versions (
     created_at timestamptz NOT NULL DEFAULT now(),
     approved_at timestamptz
 );
+
+ALTER TABLE learning_plan_proposals
+    ADD COLUMN IF NOT EXISTS curriculum_id uuid REFERENCES curriculum_versions(curriculum_id);
 
 CREATE TABLE IF NOT EXISTS curriculum_previews (
     token text PRIMARY KEY,

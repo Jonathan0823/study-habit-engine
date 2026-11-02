@@ -27,7 +27,7 @@ Record the time you actually study, mark topics complete when you have finished 
 
 ### What AI does today—and what is planned
 
-Optional Gemini can reorder eligible topics in a daily queue. Deterministic rules still enforce prerequisites, time limits, and allocation; Gemini does not create or assess the curriculum. [Issue #28](https://github.com/Jonathan0823/study-habit-engine/issues/28) tracks a future Telegram flow: describe your learning goal, review a proposed path and trusted-source links, then approve or reject it. This is not a current feature; ongoing AI tutoring is a separate idea.
+Optional Gemini can reorder eligible topics in a daily queue. Deterministic rules still enforce prerequisites, time limits, and allocation. The goal-based learning-plan flow from [issue #28](https://github.com/Jonathan0823/study-habit-engine/issues/28) is now available in Telegram: use `/learn`, describe your goal and weekly study time, review a sourced proposal, then `/approve <proposal_id>` to activate it or `/reject <proposal_id>` to leave your active plan unchanged. Ongoing AI tutoring is a separate idea.
 
 ## How planning works
 
@@ -49,6 +49,9 @@ The worker checks for the current day's routine plan at 17:00 Asia/Jakarta. It r
 | `/budget [minutes]` | Set today's planning budget to 0–90 minutes. With no argument, the bot prompts you. |
 | `/replan` | Request a replacement for today's unfinished queue. |
 | `/progress [date or action]` | Review history, add or correct a session, or reopen a topic. Dates use `YYYY-MM-DD` in `Asia/Jakarta`. |
+| `/learn` | Start a guided learning-plan proposal; reply with your goal, then weekly study minutes. |
+| `/approve <proposal_id>` | Approve and activate the reviewed learning plan. |
+| `/reject <proposal_id>` | Reject the proposal without changing your active learning plan. |
 
 The bot shows available targets when needed. Confirmations expire and can become stale if study state changes. For `/progress`, supported actions include `add`, `edit`, `reopen`, and `confirm`; see `/help` for the usage text.
 
@@ -108,13 +111,16 @@ See `.env.example` for the Compose variables:
 | `TELEGRAM_PRIVATE_CHAT_ID` | Numeric private chat ID. |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token; keep it secret. |
 | `DB_HOST_PORT` | Optional host port for PostgreSQL; defaults to `5432`. |
-| `GEMINI_API_KEY` | Optional key for Gemini topic ranking; leave empty for deterministic ranking only. |
+| `GEMINI_API_KEY` | Optional key for Gemini topic ranking and learning-plan drafts. |
 | `GEMINI_MODEL` | Pinned free-tier model ID; defaults to `gemini-3.8-flash`. Other unpriced model IDs are refused. |
 | `GEMINI_FREE_TIER_ACKNOWLEDGED` | Must be `true` to enable Gemini. Only set it after verifying the Google project is on the free tier. |
-| `AI_MAX_INPUT_TOKENS` / `AI_MAX_OUTPUT_TOKENS` | Conservative request limits; defaults are 8192 and 512. |
+| `AI_MAX_INPUT_TOKENS` / `AI_MAX_OUTPUT_TOKENS` | Topic-ranking request limits; defaults are 8192 and 512. |
+| `TAVILY_API_KEY` | Optional Tavily key for searching only the reviewed programming/CS source domains. |
+| `TAVILY_MAX_MONTHLY_CREDITS` | Local monthly search cap, at most 1,000 requests; defaults to 1,000. |
+| `AI_PLAN_MAX_INPUT_BYTES` / `AI_PLAN_MAX_OUTPUT_TOKENS` | Learning-plan prompt/output ceilings; defaults are 32,768 bytes and 4,096 tokens. |
 | `GOOGLE_CALENDAR_SECRET_DIR` | Optional host directory containing the Calendar OAuth refresh-token file; defaults to the Git-ignored `./secrets`. |
 
-Gemini is optional and disabled by default. When enabled, the worker makes at most one bounded request per planning job, validates the complete ranking, and falls back deterministically on errors, timeouts, invalid output, or exhausted local limits. The app reserves **$0** and does not intentionally spill over to paid usage. Billing is controlled by Google project/account settings; use a project that cannot incur paid usage if you require a hard $0 provider bill. Google may use free-tier request content to improve its products, so consider what curriculum details you send. Never send credentials, Telegram IDs, or unrelated personal data to the model.
+Gemini is optional and disabled by default. Set `GEMINI_FREE_TIER_ACKNOWLEDGED=true` only after confirming the Google project is on the free tier. Topic ranking falls back deterministically on errors; learning-plan generation instead fails safely and leaves the current curriculum untouched. Plan proposals also require `TAVILY_API_KEY`; the worker reserves a local search credit before each request and stops at the configured monthly cap (never above 1,000). Provider billing is controlled by your Google/Tavily account settings, so use free-tier projects/accounts if you require no paid usage. Do not use these integrations for sensitive learner data.
 
 Compose reads `.env`, but commands run directly with `uv` do not. Before using the curriculum client, set `ADMIN_API_URL` and export `ADMIN_SERVICE_TOKEN` in your shell.
 

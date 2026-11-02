@@ -31,7 +31,7 @@ class PlanOutcome(BaseModel):
 class PlanResource(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    title: str = Field(min_length=1, max_length=500)
+    title: str = Field(min_length=1, max_length=300)
     publisher: str = Field(min_length=1, max_length=500)
     url: str = Field(min_length=1, max_length=2048)
     rationale: str = Field(min_length=1, max_length=1000)
@@ -40,8 +40,8 @@ class PlanResource(BaseModel):
 class PlanTopic(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    topic_id: str = Field(pattern=_ID_PATTERN, max_length=80)
-    title: str = Field(min_length=1, max_length=2000)
+    topic_id: str = Field(pattern=_ID_PATTERN, max_length=64)
+    title: str = Field(min_length=1, max_length=300)
     description: str = Field(min_length=1, max_length=2000)
     outcome_ids: list[str] = Field(min_length=1, max_length=30)
     prerequisites: list[str] = Field(max_length=30)

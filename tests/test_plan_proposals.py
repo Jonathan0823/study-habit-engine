@@ -1,16 +1,27 @@
 import asyncio
 import os
 import uuid
+from datetime import datetime, timezone
 
 import asyncpg
 import pytest
 
 from app.db import apply_schema
+from app.plan_approval import decide_plan_proposal, parse_proposal_id
+from app.plan_jobs import process_one_learning_plan_job, reserve_tavily_credit
 from app.plan_proposals import (
     PlanProposalError,
     PostgresPlanProposalRepository,
     create_plan_proposal,
 )
+
+
+def test_proposal_id_parser_requires_exactly_one_uuid():
+    proposal_id = uuid.uuid4()
+    assert parse_proposal_id([str(proposal_id)]) == proposal_id
+    assert parse_proposal_id([]) is None
+    assert parse_proposal_id(["not-a-uuid"]) is None
+    assert parse_proposal_id([str(proposal_id), "extra"]) is None
 
 
 class FakeSearcher:
@@ -190,3 +201,175 @@ def test_postgres_proposal_save_is_pending_and_idempotent():
     assert rows[0]["proposal_id"] == first
     assert rows[0]["status"] == "pending_review"
     assert active is None
+
+
+def test_learning_plan_job_persists_proposal_and_enforces_search_cap():
+    database_url = os.environ.get("MIGRATION_DATABASE_URL")
+    if not database_url:
+        pytest.skip("PostgreSQL integration test requires MIGRATION_DATABASE_URL")
+
+    operation_id = uuid.uuid4()
+    month_start = datetime.now(timezone.utc).date().replace(day=1)
+
+    async def verify():
+        await apply_schema(database_url)
+        pool = await asyncpg.create_pool(database_url)
+        try:
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    "TRUNCATE learning_plan_jobs,learning_plan_sessions,learning_plan_proposals,tavily_search_usage,deliveries,operations CASCADE"
+                )
+                await conn.execute(
+                    "UPDATE engine_state SET active_curriculum_id=NULL WHERE singleton=true"
+                )
+                await conn.execute(
+                    "INSERT INTO operations(operation_id,source_key,request_hash,status,result) VALUES($1,$2,$3,'accepted',$4::jsonb)",
+                    operation_id,
+                    f"test:{operation_id}",
+                    "request-hash",
+                    '{"status":"accepted","result":{"code":"PLAN_ACCEPTED"}}',
+                )
+                await conn.execute(
+                    "INSERT INTO learning_plan_jobs(job_id,operation_id,goal,learner_context) VALUES($1,$2,$3,$4::jsonb)",
+                    uuid.uuid4(),
+                    operation_id,
+                    "Build a small Python command-line application.",
+                    '{"weekly_minutes":300}',
+                )
+            processed = await process_one_learning_plan_job(
+                pool,
+                uuid.uuid4(),
+                searcher=FakeSearcher(),
+                generator=FakeGenerator(),
+                monthly_search_limit=1,
+            )
+            allowed_replay = await reserve_tavily_credit(
+                pool, month_start, limit=1
+            )
+            async with pool.acquire() as conn:
+                job = await conn.fetchrow(
+                    "SELECT status,proposal_id FROM learning_plan_jobs WHERE operation_id=$1",
+                    operation_id,
+                )
+                proposal = await conn.fetchrow(
+                    "SELECT proposal_id,status FROM learning_plan_proposals WHERE operation_id=$1",
+                    operation_id,
+                )
+                operation = await conn.fetchrow(
+                    "SELECT status,result FROM operations WHERE operation_id=$1",
+                    operation_id,
+                )
+                messages = await conn.fetch(
+                    "SELECT payload FROM deliveries WHERE operation_id=$1 ORDER BY logical_key",
+                    operation_id,
+                )
+                credits = await conn.fetchval(
+                    "SELECT credits_reserved FROM tavily_search_usage WHERE month_start=$1",
+                    month_start,
+                )
+                active_before = await conn.fetchval(
+                    "SELECT active_curriculum_id FROM engine_state WHERE singleton=true"
+                )
+            approval_operation_id = uuid.uuid4()
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    "INSERT INTO operations(operation_id,source_key,request_hash,status,result) VALUES($1,$2,$3,'accepted','{}'::jsonb)",
+                    approval_operation_id,
+                    f"test-approval:{approval_operation_id}",
+                    "approval-request-hash",
+                )
+                await decide_plan_proposal(
+                    conn, approval_operation_id, proposal["proposal_id"], approve=True
+                )
+            rejected_source_operation = uuid.uuid4()
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    "INSERT INTO operations(operation_id,source_key,request_hash,status,result) VALUES($1,$2,$3,'accepted','{}'::jsonb)",
+                    rejected_source_operation,
+                    f"test-rejected-source:{rejected_source_operation}",
+                    "rejected-source-hash",
+                )
+            rejected_proposal = await create_plan_proposal(
+                operation_id=rejected_source_operation,
+                goal="Learn introductory programming.",
+                context={"weekly_minutes": 300},
+                searcher=FakeSearcher(),
+                generator=FakeGenerator(),
+                repository=PostgresPlanProposalRepository(pool),
+                trusted_hosts={"docs.python.org"},
+            )
+            rejection_operation = uuid.uuid4()
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    "INSERT INTO operations(operation_id,source_key,request_hash,status,result) VALUES($1,$2,$3,'accepted','{}'::jsonb)",
+                    rejection_operation,
+                    f"test-rejection:{rejection_operation}",
+                    "rejection-hash",
+                )
+                await decide_plan_proposal(
+                    conn,
+                    rejection_operation,
+                    uuid.UUID(rejected_proposal["proposal_id"]),
+                    approve=False,
+                )
+            async with pool.acquire() as conn:
+                final_proposal = await conn.fetchrow(
+                    "SELECT status,curriculum_id FROM learning_plan_proposals WHERE proposal_id=$1",
+                    proposal["proposal_id"],
+                )
+                version = await conn.fetchrow(
+                    "SELECT status,content FROM curriculum_versions WHERE curriculum_id=$1",
+                    final_proposal["curriculum_id"],
+                )
+                active_after = await conn.fetchval(
+                    "SELECT active_curriculum_id FROM engine_state WHERE singleton=true"
+                )
+                rejected_status = await conn.fetchval(
+                    "SELECT status FROM learning_plan_proposals WHERE proposal_id=$1",
+                    uuid.UUID(rejected_proposal["proposal_id"]),
+                )
+            return (
+                processed,
+                allowed_replay,
+                job,
+                proposal,
+                operation,
+                messages,
+                credits,
+                active_before,
+                final_proposal,
+                version,
+                active_after,
+                rejected_status,
+            )
+        finally:
+            await pool.close()
+
+    (
+        processed,
+        allowed_replay,
+        job,
+        proposal,
+        operation,
+        messages,
+        credits,
+        active_before,
+        final_proposal,
+        version,
+        active_after,
+        rejected_status,
+    ) = asyncio.run(verify())
+    assert processed is True
+    assert allowed_replay is False
+    assert job["status"] == "completed"
+    assert job["proposal_id"] == proposal["proposal_id"]
+    assert proposal["status"] == "pending_review"
+    assert operation["status"] == "completed"
+    assert len(messages) >= 1
+    assert any("/approve " in row["payload"] for row in messages)
+    assert credits == 1
+    assert active_before is None
+    assert final_proposal["status"] == "approved"
+    assert final_proposal["curriculum_id"] == active_after
+    assert version["status"] == "approved"
+    assert rejected_status == "rejected"

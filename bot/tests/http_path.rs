@@ -28,8 +28,10 @@ async fn simulated_help_update_is_admitted_once_and_delivered_from_outbox() {
         actor_id: 111,
         chat_id: 111,
         chat_type: "private".into(),
+        kind: "command".into(),
         command: "help".into(),
         arguments: vec![],
+        text: None,
     };
     let first = admit_update(&client, &api, &secret, fence, make_update())
         .await
@@ -57,11 +59,51 @@ async fn simulated_help_update_is_admitted_once_and_delivered_from_outbox() {
         delivery["text"]
             .as_str()
             .unwrap()
-            .starts_with("/help - Show the eight supported commands and their usage")
+            .starts_with("/help - Show supported commands and their usage")
     );
     let result = client.post(format!("{api}/v1/deliveries/{}/result", delivery["delivery_id"].as_str().unwrap()))
         .bearer_auth(&secret)
         .json(&json!({"fence":delivery["fence"],"outcome":"sent","telegram_receipt":"test-message-1"}))
         .send().await.unwrap();
     assert_eq!(result.status(), reqwest::StatusCode::OK);
+
+    let learning_start = admit_update(
+        &client,
+        &api,
+        &secret,
+        fence,
+        NormalizedUpdate {
+            update_id: 900002,
+            actor_id: 111,
+            chat_id: 111,
+            chat_type: "private".into(),
+            kind: "command".into(),
+            command: "learn".into(),
+            arguments: vec![],
+            text: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(learning_start.status, "accepted");
+
+    let goal_reply = admit_update(
+        &client,
+        &api,
+        &secret,
+        fence,
+        NormalizedUpdate {
+            update_id: 900003,
+            actor_id: 111,
+            chat_id: 111,
+            chat_type: "private".into(),
+            kind: "text".into(),
+            command: String::new(),
+            arguments: vec![],
+            text: Some("Learn Python for automation".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(goal_reply.status, "completed");
 }

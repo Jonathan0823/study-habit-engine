@@ -149,7 +149,7 @@ def main():
         assert len(TelegramMock.sent_messages) == 1
         sent = TelegramMock.sent_messages[0]
         assert sent["chat_id"] == "111"
-        assert sent["text"].startswith("/help - Show the eight supported commands")
+        assert sent["text"].startswith("/help - Show supported commands")
         print(
             "Rust bot process: redelivery stayed idempotent, durable offset acknowledged, /help sent"
         )

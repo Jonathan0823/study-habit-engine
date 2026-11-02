@@ -157,6 +157,18 @@ async def create_plan_proposal(
     if errors:
         raise PlanProposalError("INVALID_PLAN", errors)
 
+    # Give each proposal fresh curriculum identities so activation never silently
+    # carries completion from a different, model-generated learning path.
+    topic_id_map = {
+        topic["topic_id"]: f"p-{operation_id.hex}-{index + 1}"
+        for index, topic in enumerate(generated["topics"])
+    }
+    for topic in generated["topics"]:
+        topic["topic_id"] = topic_id_map[topic["topic_id"]]
+        topic["prerequisites"] = [
+            topic_id_map[item] for item in topic["prerequisites"]
+        ]
+
     proposal_id = await repository.save_pending(
         operation_id, goal.strip(), context, generated
     )
