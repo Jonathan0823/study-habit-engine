@@ -1,6 +1,9 @@
 import asyncio
 
-from app.source_search import TavilySourceSearcher
+from app.source_search import (
+    TavilySourceSearcher,
+    configured_tavily_source_searcher,
+)
 
 
 class FakeResponse:
@@ -62,3 +65,26 @@ def test_tavily_search_restricts_domains_and_returns_only_safe_link_metadata():
     assert http_client.request["json"]["search_depth"] == "basic"
     assert http_client.request["json"]["include_raw_content"] is False
     assert http_client.request["json"]["include_answer"] is False
+
+
+def test_tavily_search_is_disabled_without_api_key(monkeypatch):
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    assert configured_tavily_source_searcher(FakeHttpClient()) is None
+
+
+def test_configured_tavily_search_uses_reviewed_programming_hosts(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    http_client = FakeHttpClient()
+
+    searcher = configured_tavily_source_searcher(http_client)
+
+    assert searcher is not None
+    asyncio.run(searcher.search("Python basics"))
+
+    assert http_client.request["json"]["include_domains"] == [
+        "cs50.harvard.edu",
+        "developer.mozilla.org",
+        "docs.python.org",
+        "git-scm.com",
+    ]

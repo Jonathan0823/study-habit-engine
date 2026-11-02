@@ -3,7 +3,22 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 from urllib.parse import urlsplit
+
+from app.trusted_sources import SOFTWARE_CS_TRUSTED_HOSTS
+
+
+def configured_tavily_source_searcher(http_client):
+    """Build the optional adapter from the reviewed catalog and configured key."""
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return None
+    return TavilySourceSearcher(
+        api_key=api_key,
+        trusted_hosts=set(SOFTWARE_CS_TRUSTED_HOSTS),
+        http_client=http_client,
+    )
 
 
 class TavilySourceSearcher:

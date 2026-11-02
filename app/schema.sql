@@ -10,6 +10,37 @@ ALTER TABLE operations DROP CONSTRAINT IF EXISTS operations_status_check;
 ALTER TABLE operations ADD CONSTRAINT operations_status_check
     CHECK (status IN ('accepted', 'rejected', 'completed'));
 
+CREATE TABLE IF NOT EXISTS learning_plan_proposals (
+    proposal_id uuid PRIMARY KEY,
+    operation_id uuid NOT NULL UNIQUE REFERENCES operations(operation_id),
+    goal text NOT NULL CHECK (length(btrim(goal)) BETWEEN 1 AND 2000),
+    learner_context jsonb NOT NULL,
+    content jsonb NOT NULL,
+    content_hash text NOT NULL,
+    status text NOT NULL DEFAULT 'pending_review'
+        CHECK (status IN ('pending_review','approved','rejected')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    decided_at timestamptz
+);
+
+CREATE OR REPLACE FUNCTION prevent_learning_plan_proposal_content_mutation() RETURNS trigger AS $$
+BEGIN
+    IF NEW.proposal_id IS DISTINCT FROM OLD.proposal_id
+       OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
+       OR NEW.goal IS DISTINCT FROM OLD.goal
+       OR NEW.learner_context IS DISTINCT FROM OLD.learner_context
+       OR NEW.content IS DISTINCT FROM OLD.content
+       OR NEW.content_hash IS DISTINCT FROM OLD.content_hash THEN
+        RAISE EXCEPTION 'learning plan proposal content is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS learning_plan_proposal_content_immutable ON learning_plan_proposals;
+CREATE TRIGGER learning_plan_proposal_content_immutable
+    BEFORE UPDATE ON learning_plan_proposals
+    FOR EACH ROW EXECUTE FUNCTION prevent_learning_plan_proposal_content_mutation();
+
 CREATE TABLE IF NOT EXISTS telegram_ingestion (
     bot_id bigint NOT NULL,
     update_id bigint NOT NULL,

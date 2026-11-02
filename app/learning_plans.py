@@ -14,6 +14,7 @@ def validate_learning_plan(
     *,
     trusted_hosts: set[str],
     weekly_minutes: int,
+    candidate_urls: set[str] | None = None,
 ) -> list[str]:
     """Return deterministic structural/policy errors; an empty list means valid.
 
@@ -101,7 +102,7 @@ def validate_learning_plan(
             errors.append("MISSING_TOPIC_RESOURCES")
             continue
         for resource in resources:
-            errors.extend(_resource_errors(resource, trusted_hosts))
+            errors.extend(_resource_errors(resource, trusted_hosts, candidate_urls))
 
     linked_outcomes = {
         outcome_id
@@ -144,13 +145,18 @@ def validate_learning_plan(
     return errors
 
 
-def _resource_errors(resource: object, trusted_hosts: set[str]) -> list[str]:
-    if not isinstance(resource, dict) or set(resource) != {
-        "title",
-        "publisher",
-        "url",
-        "rationale",
-    }:
+def _resource_errors(
+    resource: object,
+    trusted_hosts: set[str],
+    candidate_urls: set[str] | None,
+) -> list[str]:
+    required_fields = {"title", "publisher", "url", "rationale"}
+    optional_fields = {"published_at", "checked_at"}
+    if (
+        not isinstance(resource, dict)
+        or not required_fields <= set(resource)
+        or not set(resource) <= required_fields | optional_fields
+    ):
         return ["INVALID_RESOURCE"]
     if not _nonempty(resource.get("title"), 500):
         return ["INVALID_RESOURCE_TITLE"]
@@ -158,6 +164,12 @@ def _resource_errors(resource: object, trusted_hosts: set[str]) -> list[str]:
         return ["INVALID_RESOURCE_PUBLISHER"]
     if not _nonempty(resource.get("rationale"), 1000):
         return ["INVALID_RESOURCE_RATIONALE"]
+    published_at = resource.get("published_at")
+    if published_at is not None and not _nonempty(published_at, 200):
+        return ["INVALID_RESOURCE_DATE"]
+    checked_at = resource.get("checked_at")
+    if checked_at is not None and not _nonempty(checked_at, 50):
+        return ["INVALID_RESOURCE_CHECKED_AT"]
     url = resource.get("url")
     if not isinstance(url, str) or len(url) > 2048:
         return ["UNTRUSTED_RESOURCE_URL"]
@@ -182,8 +194,14 @@ def _resource_errors(resource: object, trusted_hosts: set[str]) -> list[str]:
         pass
     else:
         return ["UNTRUSTED_RESOURCE_URL"]
-    allowed_hosts = {item.casefold().rstrip(".") for item in trusted_hosts if isinstance(item, str)}
-    return [] if host in allowed_hosts else ["UNTRUSTED_RESOURCE_HOST"]
+    allowed_hosts = {
+        item.casefold().rstrip(".") for item in trusted_hosts if isinstance(item, str)
+    }
+    if host not in allowed_hosts:
+        return ["UNTRUSTED_RESOURCE_HOST"]
+    if candidate_urls is not None and url not in candidate_urls:
+        return ["RESOURCE_NOT_FROM_SEARCH_RESULTS"]
+    return []
 
 
 def _has_cycle(graph: dict[str, list[str]]) -> bool:
