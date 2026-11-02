@@ -1,6 +1,9 @@
 COMMANDS = (
-    ("help", "", "Show the eight supported commands and their usage"),
+    ("help", "", "Show supported commands and their usage"),
     ("today", "", "View today's study queue; create it only when absent"),
+    ("learn", "", "Start a guided, reviewable learning-plan proposal"),
+    ("approve", "<proposal_id>", "Approve and activate a reviewed learning plan"),
+    ("reject", "<proposal_id>", "Reject a learning-plan proposal without activating it"),
     (
         "done",
         "[block_id] | <token> <actual_minutes>",

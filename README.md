@@ -1,6 +1,6 @@
 # Study Habit Engine
 
-A single-user Telegram study planner that turns an approved curriculum into a prerequisite-aware daily study queue—without accumulating catch-up debt when you miss a day.
+A personal Telegram study planner that turns your chosen learning material into a prerequisite-aware daily study queue—without accumulating catch-up work when you miss a day.
 
 Record the time you actually study, mark topics complete when you have finished learning them, and plan from the work that is eligible now. Study blocks are not fixed-time appointments, and a missed day does not create overdue work.
 
@@ -8,27 +8,26 @@ Record the time you actually study, mark topics complete when you have finished 
 
 ## What you can do
 
-### As a learner
+### Choose what to learn
 
-- Get a daily queue built from your available budget and topics whose prerequisites are complete. Topics with recorded study time are prioritized before other eligible topics.
-- Change today's planning budget (default 60 minutes; maximum 90) or request a replacement queue.
-- Record the actual time spent on a block or skip it. Completing a block does not automatically complete its topic.
-- Review study history, add or correct a past session, and explicitly complete or reopen topics. These changes are confirmed before they are applied.
-- Miss a day without building up catch-up work. The queue is for that local study date; unfinished work returns to the unscheduled backlog.
+- Choose a subject and review a curriculum of topics, prerequisites, objectives, and learning resources. Provide one yourself or use `/learn` to generate an AI-drafted proposal with self-review notes; review and approve it before activation. The app does not certify a plan's teaching quality.
+- Preview a curriculum's effects on completed topics and existing queues before activating it.
+- When changing topic identities, map completed topics explicitly so that progress is not silently reassigned.
 
-### As an operator
+### Get a plan for today
 
-- Import a manually reviewed curriculum containing stable topic IDs, prerequisites, objectives, and learning resources.
-- Validate a curriculum and preview its effects on topic completion and existing queues before activation.
-- Use explicit completion mappings when revising curriculum identities; historical study time is not silently reassigned.
-- Administer curriculum through the authenticated API client rather than writing directly to PostgreSQL.
+- Get a queue sized to your available time and limited to topics whose prerequisites are complete. Topics with recorded study time are prioritized.
+- Change today's budget (default 60 minutes; maximum 90) or request a replacement queue.
+- Miss a day without accumulating catch-up work. Each queue belongs to one local study date; unfinished work returns to the unscheduled backlog.
 
-### Under the hood
+### Track your progress
 
-- PostgreSQL stores curriculum, progress, plans, operations, planning jobs, and pending deliveries.
-- Telegram updates are admitted durably before the bot advances its polling offset, and duplicate updates do not repeat the underlying operation.
-- Outgoing messages use a database-backed delivery queue. Delivery is at-least-once: a lost send receipt can result in a duplicate message.
-- Deterministic code owns eligibility, allocation, and fallback. Optional Gemini ranking is disabled unless a key and explicit free-tier acknowledgement are configured.
+- Record the time you actually studied or skip a block. Completing a block does not automatically complete its topic.
+- Review study history, add or correct a past session, and explicitly complete or reopen topics. Changes are confirmed before they are applied.
+
+### What AI does today—and what is planned
+
+Optional Gemini can reorder eligible topics in a daily queue. Deterministic rules still enforce prerequisites, time limits, and allocation. The goal-based learning-plan flow from [issue #28](https://github.com/Jonathan0823/study-habit-engine/issues/28) is now available in Telegram: use `/learn`, describe your goal and weekly study time, review the sourced proposal and clearly labeled AI self-review notes, then `/approve <proposal_id>` to activate it or `/reject <proposal_id>` to leave your active plan unchanged. The self-review is guidance, not proof of effectiveness; see the [quality-review rubric](docs/design/learning-plan-quality-rubric.md). Ongoing AI tutoring is a separate idea.
 
 ## How planning works
 
@@ -50,6 +49,9 @@ The worker checks for the current day's routine plan at 17:00 Asia/Jakarta. It r
 | `/budget [minutes]` | Set today's planning budget to 0–90 minutes. With no argument, the bot prompts you. |
 | `/replan` | Request a replacement for today's unfinished queue. |
 | `/progress [date or action]` | Review history, add or correct a session, or reopen a topic. Dates use `YYYY-MM-DD` in `Asia/Jakarta`. |
+| `/learn` | Start a guided learning-plan proposal; reply with your goal, then weekly study minutes. |
+| `/approve <proposal_id>` | Approve and activate the reviewed learning plan. |
+| `/reject <proposal_id>` | Reject the proposal without changing your active learning plan. |
 
 The bot shows available targets when needed. Confirmations expire and can become stale if study state changes. For `/progress`, supported actions include `add`, `edit`, `reopen`, and `confirm`; see `/help` for the usage text.
 
@@ -109,13 +111,16 @@ See `.env.example` for the Compose variables:
 | `TELEGRAM_PRIVATE_CHAT_ID` | Numeric private chat ID. |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token; keep it secret. |
 | `DB_HOST_PORT` | Optional host port for PostgreSQL; defaults to `5432`. |
-| `GEMINI_API_KEY` | Optional key for Gemini topic ranking; leave empty for deterministic ranking only. |
+| `GEMINI_API_KEY` | Optional key for Gemini topic ranking and learning-plan drafts. |
 | `GEMINI_MODEL` | Pinned free-tier model ID; defaults to `gemini-3.8-flash`. Other unpriced model IDs are refused. |
 | `GEMINI_FREE_TIER_ACKNOWLEDGED` | Must be `true` to enable Gemini. Only set it after verifying the Google project is on the free tier. |
-| `AI_MAX_INPUT_TOKENS` / `AI_MAX_OUTPUT_TOKENS` | Conservative request limits; defaults are 8192 and 512. |
+| `AI_MAX_INPUT_TOKENS` / `AI_MAX_OUTPUT_TOKENS` | Topic-ranking request limits; defaults are 8192 and 512. |
+| `TAVILY_API_KEY` | Optional Tavily key for searching only the reviewed programming/CS source domains. |
+| `TAVILY_MAX_MONTHLY_CREDITS` | Local monthly search cap, at most 1,000 requests; defaults to 1,000. |
+| `AI_PLAN_MAX_INPUT_BYTES` / `AI_PLAN_MAX_OUTPUT_TOKENS` | Learning-plan prompt/output ceilings; defaults are 32,768 bytes and 4,096 tokens. |
 | `GOOGLE_CALENDAR_SECRET_DIR` | Optional host directory containing the Calendar OAuth refresh-token file; defaults to the Git-ignored `./secrets`. |
 
-Gemini is optional and disabled by default. When enabled, the worker makes at most one bounded request per planning job, validates the complete ranking, and falls back deterministically on errors, timeouts, invalid output, or exhausted local limits. The app reserves **$0** and does not intentionally spill over to paid usage. Billing is controlled by Google project/account settings; use a project that cannot incur paid usage if you require a hard $0 provider bill. Google may use free-tier request content to improve its products, so consider what curriculum details you send. Never send credentials, Telegram IDs, or unrelated personal data to the model.
+Gemini is optional and disabled by default. Set `GEMINI_FREE_TIER_ACKNOWLEDGED=true` only after confirming the Google project is on the free tier. Topic ranking falls back deterministically on errors; learning-plan generation instead fails safely and leaves the current curriculum untouched. Plan proposals also require `TAVILY_API_KEY`; the worker reserves a local search credit before each request and stops at the configured monthly cap (never above 1,000). Provider billing is controlled by your Google/Tavily account settings, so use free-tier projects/accounts if you require no paid usage. Do not use these integrations for sensitive learner data.
 
 Compose reads `.env`, but commands run directly with `uv` do not. Before using the curriculum client, set `ADMIN_API_URL` and export `ADMIN_SERVICE_TOKEN` in your shell.
 
@@ -192,7 +197,7 @@ The script starts a disposable PostgreSQL/API stack, runs Python and Rust tests,
 ## Architecture
 
 - **Rust Telegram bot:** polls Telegram, submits updates to the API, and sends queued responses.
-- **Python FastAPI service:** authenticates the bot and curriculum operator and handles study and curriculum operations.
+- **Python FastAPI service:** authenticates bot requests and curriculum-management requests and handles study operations.
 - **Python planning worker:** processes durable jobs, optionally requests a bounded Gemini ranking, uses deterministic validation, allocation, and fallback, and synchronizes optional Google Calendar reminders.
 - **PostgreSQL:** stores curriculum, progress, plans, jobs, operations, and pending deliveries.
 - **LangGraph:** provides the worker's graph/checkpoint structure; the optional Gemini ranking call runs within the planning path.
@@ -212,8 +217,8 @@ docs/agents/          Contributor and agent workflow guidance
 ## Scope and limitations
 
 - The first version is for one authorized Telegram user, not a multi-user service.
-- Curriculum content and resources are manually reviewed; the engine does not generate or independently verify them.
-- AI-assisted ranking is optional, disabled by default, and limited to topic ordering; it does not generate topics or allocate study blocks.
+- `/learn` can generate an AI-drafted curriculum proposal with self-review notes for you to review and approve. The app does not certify a plan's teaching quality or treat its self-review as proof.
+- Optional Gemini ranking is disabled by default and only reorders topics eligible for today's queue. `/learn` separately drafts a curriculum proposal; neither feature allocates study blocks, which remain deterministic.
 - Production readiness, backup and restore, external monitoring, and operational recovery have not been established or verified.
 - Telegram retains incoming updates for a limited time. A prolonged outage can mean an update was never accepted; recovery of every command is not guaranteed.
 

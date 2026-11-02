@@ -761,7 +761,16 @@ async def run_worker() -> None:
         os.environ["DATABASE_URL"], autocommit=True
     )
     calendar_client = None
+    search_http_client = None
     try:
+        from app.plan_generation import configured_gemini_plan_generator
+        from app.plan_jobs import process_one_learning_plan_job
+        from app.source_search import configured_tavily_source_searcher
+        import httpx
+
+        search_http_client = httpx.AsyncClient(timeout=10, follow_redirects=False)
+        searcher = configured_tavily_source_searcher(search_http_client)
+        plan_generator = configured_gemini_plan_generator()
         # Checkpoint tables are provisioned by app.migrate using migration credentials.
         saver = AsyncPostgresSaver(checkpoint_conn)
         graph = build_graph(saver, pool, owner)
@@ -785,6 +794,20 @@ async def run_worker() -> None:
             elif calendar_client is not None:
                 await calendar_client.close()
                 calendar_client = None
+            try:
+                monthly_search_limit = int(
+                    os.getenv("TAVILY_MAX_MONTHLY_CREDITS", "1000")
+                )
+            except ValueError:
+                monthly_search_limit = 0
+            if await process_one_learning_plan_job(
+                pool,
+                owner,
+                searcher=searcher,
+                generator=plan_generator,
+                monthly_search_limit=monthly_search_limit,
+            ):
+                continue
             job_id = await next_job(pool)
             if job_id is None:
                 await asyncio.sleep(1)
@@ -796,6 +819,8 @@ async def run_worker() -> None:
     finally:
         if calendar_client is not None:
             await calendar_client.close()
+        if search_http_client is not None:
+            await search_http_client.aclose()
         await checkpoint_conn.close()
         await pool.close()
 

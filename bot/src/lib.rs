@@ -16,8 +16,10 @@ pub struct NormalizedUpdate {
     pub actor_id: i64,
     pub chat_id: i64,
     pub chat_type: String,
+    pub kind: String,
     pub command: String,
     pub arguments: Vec<String>,
+    pub text: Option<String>,
 }
 
 pub async fn admit_update(
@@ -27,6 +29,11 @@ pub async fn admit_update(
     poller_fence: i64,
     update: NormalizedUpdate,
 ) -> Result<Admission, String> {
+    let payload = if update.kind == "text" {
+        json!({"kind":"text","text":update.text})
+    } else {
+        json!({"kind":"command","command":update.command,"arguments":update.arguments})
+    };
     let response = client
         .post(format!("{api_url}/v1/telegram/updates"))
         .bearer_auth(token)
@@ -37,7 +44,7 @@ pub async fn admit_update(
             "chat_id": update.chat_id.to_string(),
             "chat_type": update.chat_type,
             "poller_fence": poller_fence,
-            "payload": {"kind": "command", "command": update.command, "arguments": update.arguments}
+            "payload": payload
         }))
         .send()
         .await
@@ -172,37 +179,64 @@ pub async fn run() -> Result<(), String> {
         )
         .await?;
         for update in updates {
-            let (sender, chat_id, chat_type, command, arguments) = match update.message {
+            let (sender, chat_id, chat_type, kind, command, arguments, text) = match update.message
+            {
                 Some(message) => {
                     let sender = message.from.map(|u| u.id).unwrap_or_default();
-                    let text = message.text.unwrap_or_default();
-                    let mut parts = text.split_whitespace();
-                    let raw_command = parts.next().unwrap_or("");
-                    let command = raw_command
-                        .trim_start_matches('/')
-                        .split('@')
-                        .next()
-                        .unwrap_or("");
-                    let command = if command.is_empty() {
-                        "unsupported"
+                    let message_text = message.text.unwrap_or_default();
+                    if message_text.starts_with('/') {
+                        let mut parts = message_text.split_whitespace();
+                        let raw_command = parts.next().unwrap_or("");
+                        let command = raw_command
+                            .trim_start_matches('/')
+                            .split('@')
+                            .next()
+                            .unwrap_or("");
+                        let command = if command.is_empty() {
+                            "unsupported"
+                        } else {
+                            command
+                        }
+                        .to_string();
+                        (
+                            sender,
+                            message.chat.id,
+                            message.chat.kind,
+                            "command".to_string(),
+                            command,
+                            parts.map(str::to_string).collect(),
+                            None,
+                        )
+                    } else if !message_text.trim().is_empty() {
+                        (
+                            sender,
+                            message.chat.id,
+                            message.chat.kind,
+                            "text".to_string(),
+                            String::new(),
+                            vec![],
+                            Some(message_text),
+                        )
                     } else {
-                        command
+                        (
+                            sender,
+                            message.chat.id,
+                            message.chat.kind,
+                            "command".to_string(),
+                            "unsupported".to_string(),
+                            vec![],
+                            None,
+                        )
                     }
-                    .to_string();
-                    (
-                        sender,
-                        message.chat.id,
-                        message.chat.kind,
-                        command,
-                        parts.map(str::to_string).collect(),
-                    )
                 }
                 None => (
                     0,
                     0,
                     "private".to_string(),
+                    "command".to_string(),
                     "unsupported".to_string(),
                     vec![],
+                    None,
                 ),
             };
             let _ = admit_update(
@@ -215,8 +249,10 @@ pub async fn run() -> Result<(), String> {
                     actor_id: sender,
                     chat_id,
                     chat_type,
+                    kind,
                     command,
                     arguments,
+                    text,
                 },
             )
             .await?;

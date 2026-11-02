@@ -179,6 +179,9 @@ def test_all_shared_future_commands_are_recognized_but_not_implemented(client):
             "skip",
             "complete_topic",
             "progress",
+            "learn",
+            "approve",
+            "reject",
         )
     ]
 
