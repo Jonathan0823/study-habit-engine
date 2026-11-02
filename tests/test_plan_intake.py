@@ -166,7 +166,68 @@ def test_goal_to_plan_intake_persists_one_job_after_goal_and_time_budget(client)
     assert active is None
 
 
-def test_telegram_approval_activates_and_rejection_preserves_active_curriculum(client):
+def test_telegram_payload_accepts_4096_char_messages_and_unbounded_goal_tokens(client):
+    headers = {"Authorization": "Bearer bot-secret"}
+    fence = poller(client)
+
+    long_token = client.post(
+        "/v1/telegram/updates",
+        json=telegram_update(
+            new_update_id(),
+            fence,
+            {"kind": "command", "command": "learn", "arguments": ["x" * 2050]},
+        ),
+        headers=headers,
+    )
+    assert long_token.status_code == 200
+    assert long_token.json()["result"]["code"] == "INVALID_LEARNING_GOAL"
+    assert "up to 2,000 characters" in delivered_text(
+        client, long_token.json()["operation_id"]
+    )
+
+    oversized_text = client.post(
+        "/v1/telegram/updates",
+        json=telegram_update(
+            new_update_id(), fence, {"kind": "text", "text": "x" * 4096}
+        ),
+        headers=headers,
+    )
+    assert oversized_text.status_code == 200
+    assert oversized_text.json()["result"]["code"] == "INVALID_LEARNING_GOAL"
+    assert "up to 2,000 characters" in delivered_text(
+        client, oversized_text.json()["operation_id"]
+    )
+
+    many_tokens = ["goal"] * 40
+    accepted = client.post(
+        "/v1/telegram/updates",
+        json=telegram_update(
+            new_update_id(),
+            fence,
+            {"kind": "command", "command": "learn", "arguments": many_tokens},
+        ),
+        headers=headers,
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "accepted"
+
+    async def fetch_session():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            return await conn.fetchrow(
+                "SELECT phase,goal FROM learning_plan_sessions WHERE actor_id=111 AND chat_id=111"
+            )
+        finally:
+            await conn.close()
+
+    session = asyncio.run(fetch_session())
+    assert session["phase"] == "awaiting_weekly_minutes"
+    assert session["goal"] == " ".join(many_tokens)
+
+
+def test_telegram_approval_activates_and_rejection_preserves_active_curriculum(
+    client, monkeypatch
+):
     database_url = os.environ["DATABASE_URL"]
 
     async def create_proposal(label):
@@ -302,4 +363,25 @@ def test_telegram_approval_activates_and_rejection_preserves_active_curriculum(c
     assert rejected.status_code == 200
     assert rejected.json()["status"] == "completed"
     assert rejected.json()["result"]["code"] == "LEARNING_PLAN_REJECTED"
+    assert asyncio.run(active_curriculum_id()) == active_id
+
+    invalid_id = asyncio.run(create_proposal("validation-error"))
+    from app.curriculum import Curriculum
+
+    def fail_validation(cls, value, **kwargs):
+        raise ValueError("simulated curriculum validation failure")
+
+    monkeypatch.setattr(Curriculum, "model_validate", classmethod(fail_validation))
+    failed = client.post(
+        "/v1/telegram/updates",
+        json=telegram_update(
+            new_update_id(),
+            fence,
+            {"kind": "command", "command": "approve", "arguments": [str(invalid_id)]},
+        ),
+        headers=headers,
+    )
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "completed"
+    assert failed.json()["result"]["code"] == "PLAN_PROPOSAL_FAILED_VALIDATION"
     assert asyncio.run(active_curriculum_id()) == active_id

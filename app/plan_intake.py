@@ -21,7 +21,8 @@ async def begin_learning_plan(
     chat_id: int,
     initial_goal: str = "",
 ):
-    goal = initial_goal if initial_goal and len(initial_goal) <= 2000 else None
+    goal_too_long = bool(initial_goal) and len(initial_goal) > 2000
+    goal = initial_goal if initial_goal and not goal_too_long else None
     phase = "awaiting_weekly_minutes" if goal else "awaiting_goal"
     await conn.execute(
         """INSERT INTO learning_plan_sessions
@@ -38,7 +39,9 @@ async def begin_learning_plan(
         goal,
     )
     prompt = (
-        "How many whole minutes can you study per week? Reply with a number from 1 to 10080 (for example, 300)."
+        "Send your learning goal in one message (up to 2,000 characters)."
+        if goal_too_long
+        else "How many whole minutes can you study per week? Reply with a number from 1 to 10080 (for example, 300)."
         if goal
         else "What do you want to learn? Include what you already know, and any deadline or language preference that matters."
     )
@@ -48,6 +51,8 @@ async def begin_learning_plan(
         f"operation:{operation_id}:learn-start",
         prompt,
     )
+    if goal_too_long:
+        await _complete_operation(conn, operation_id, "INVALID_LEARNING_GOAL")
 
 
 async def accept_learning_plan_text(

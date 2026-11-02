@@ -126,6 +126,8 @@ def validate_learning_plan(
         prerequisites = topic.get("prerequisites")
         if not isinstance(prerequisites, list) or any(not isinstance(ref, str) for ref in prerequisites):
             errors.append("INVALID_PREREQUISITES")
+        elif len(prerequisites) != len(set(prerequisites)):
+            errors.append("INVALID_PREREQUISITES")
         resources = topic.get("resources")
         if not isinstance(resources, list) or not resources:
             errors.append("MISSING_TOPIC_RESOURCES")

@@ -10,7 +10,7 @@ Record the time you actually study, mark topics complete when you have finished 
 
 ### Choose what to learn
 
-- Choose a subject and prepare a reviewed curriculum of topics, prerequisites, objectives, and learning resources. Today, you provide this curriculum; the app does not generate or judge its teaching quality.
+- Choose a subject and review a curriculum of topics, prerequisites, objectives, and learning resources. Provide one yourself or use `/learn` to generate an AI-drafted proposal with self-review notes; review and approve it before activation. The app does not certify a plan's teaching quality.
 - Preview a curriculum's effects on completed topics and existing queues before activating it.
 - When changing topic identities, map completed topics explicitly so that progress is not silently reassigned.
 
@@ -217,8 +217,8 @@ docs/agents/          Contributor and agent workflow guidance
 ## Scope and limitations
 
 - The first version is for one authorized Telegram user, not a multi-user service.
-- Curriculum content and resources are manually reviewed; the engine does not generate or independently verify them.
-- AI-assisted ranking is optional, disabled by default, and limited to topic ordering; it does not generate topics or allocate study blocks.
+- `/learn` can generate an AI-drafted curriculum proposal with self-review notes for you to review and approve. The app does not certify a plan's teaching quality or treat its self-review as proof.
+- Optional Gemini ranking is disabled by default and only reorders topics eligible for today's queue. `/learn` separately drafts a curriculum proposal; neither feature allocates study blocks, which remain deterministic.
 - Production readiness, backup and restore, external monitoring, and operational recovery have not been established or verified.
 - Telegram retains incoming updates for a limited time. A prolonged outage can mean an update was never accepted; recovery of every command is not guaranteed.
 

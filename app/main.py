@@ -5,7 +5,7 @@ import os
 import secrets
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal
+from typing import Literal
 
 import asyncpg
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -23,15 +23,17 @@ class Payload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["command", "text"]
     command: str = Field(default="", max_length=32)
-    arguments: list[Annotated[str, Field(max_length=128)]] = Field(
-        default_factory=list, max_length=32
-    )
-    text: str | None = Field(default=None, min_length=1, max_length=2000)
+    arguments: list[str] = Field(default_factory=list)
+    text: str | None = Field(default=None, min_length=1, max_length=4096)
 
     @model_validator(mode="after")
     def validate_kind_fields(self):
         if self.kind == "command" and (not self.command or self.text is not None):
             raise ValueError("command payload requires a command and no text")
+        if self.kind == "command" and sum(map(len, self.arguments)) + max(
+            len(self.arguments) - 1, 0
+        ) > 4096:
+            raise ValueError("command arguments exceed the Telegram message limit")
         if self.kind == "text" and (not self.text or self.command or self.arguments):
             raise ValueError("text payload requires text and no command arguments")
         return self

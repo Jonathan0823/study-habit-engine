@@ -6,6 +6,8 @@ import hashlib
 import json
 import uuid
 
+from pydantic import ValidationError
+
 from app.curriculum import Curriculum, canonical_content, curriculum_impact
 from app.learning_plans import validate_learning_plan
 from app.trusted_sources import SOFTWARE_CS_TRUSTED_HOSTS
@@ -124,7 +126,16 @@ async def decide_plan_proposal(
         )
         return
     content = _curriculum_content(plan)
-    curriculum, digest = canonical_content(Curriculum.model_validate(content))
+    try:
+        curriculum, digest = canonical_content(Curriculum.model_validate(content))
+    except (ValidationError, ValueError):
+        await _finish(
+            conn,
+            operation_id,
+            "PLAN_PROPOSAL_FAILED_VALIDATION",
+            "That proposal could not be converted into a valid curriculum, so it was not activated.",
+        )
+        return
     curriculum_id = uuid.uuid4()
     await conn.execute(
         "INSERT INTO curriculum_versions(curriculum_id,status,content_hash,content) VALUES($1,'draft',$2,$3::jsonb)",

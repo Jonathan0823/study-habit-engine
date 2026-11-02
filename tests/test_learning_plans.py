@@ -85,6 +85,18 @@ def test_malformed_prerequisite_values_are_rejected_without_crashing():
     )
 
 
+def test_duplicate_prerequisites_are_rejected_as_invalid_references():
+    plan = valid_plan()
+    plan["topics"][0]["prerequisites"] = ["earlier-topic", "earlier-topic"]
+
+    errors = validate_learning_plan(
+        plan,
+        trusted_hosts={"docs.python.org"},
+        weekly_minutes=300,
+    )
+    assert "INVALID_PREREQUISITES" in errors
+
+
 def test_quality_review_must_cover_each_criterion_and_valid_plan_ids():
     plan = valid_plan()
     plan["quality_review"] = plan["quality_review"][:-1]
