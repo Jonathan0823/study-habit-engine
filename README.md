@@ -1,6 +1,6 @@
 # Study Habit Engine
 
-A single-user Telegram study planner that turns an approved curriculum into a prerequisite-aware daily study queue—without accumulating catch-up debt when you miss a day.
+A personal Telegram study planner that turns your chosen learning material into a prerequisite-aware daily study queue—without accumulating catch-up work when you miss a day.
 
 Record the time you actually study, mark topics complete when you have finished learning them, and plan from the work that is eligible now. Study blocks are not fixed-time appointments, and a missed day does not create overdue work.
 
@@ -8,27 +8,26 @@ Record the time you actually study, mark topics complete when you have finished 
 
 ## What you can do
 
-### As a learner
+### Choose what to learn
 
-- Get a daily queue built from your available budget and topics whose prerequisites are complete. Topics with recorded study time are prioritized before other eligible topics.
-- Change today's planning budget (default 60 minutes; maximum 90) or request a replacement queue.
-- Record the actual time spent on a block or skip it. Completing a block does not automatically complete its topic.
-- Review study history, add or correct a past session, and explicitly complete or reopen topics. These changes are confirmed before they are applied.
-- Miss a day without building up catch-up work. The queue is for that local study date; unfinished work returns to the unscheduled backlog.
+- Choose a subject and prepare a reviewed curriculum of topics, prerequisites, objectives, and learning resources. Today, you provide this curriculum; the app does not generate or judge its teaching quality.
+- Preview a curriculum's effects on completed topics and existing queues before activating it.
+- When changing topic identities, map completed topics explicitly so that progress is not silently reassigned.
 
-### As an operator
+### Get a plan for today
 
-- Import a manually reviewed curriculum containing stable topic IDs, prerequisites, objectives, and learning resources.
-- Validate a curriculum and preview its effects on topic completion and existing queues before activation.
-- Use explicit completion mappings when revising curriculum identities; historical study time is not silently reassigned.
-- Administer curriculum through the authenticated API client rather than writing directly to PostgreSQL.
+- Get a queue sized to your available time and limited to topics whose prerequisites are complete. Topics with recorded study time are prioritized.
+- Change today's budget (default 60 minutes; maximum 90) or request a replacement queue.
+- Miss a day without accumulating catch-up work. Each queue belongs to one local study date; unfinished work returns to the unscheduled backlog.
 
-### Under the hood
+### Track your progress
 
-- PostgreSQL stores curriculum, progress, plans, operations, planning jobs, and pending deliveries.
-- Telegram updates are admitted durably before the bot advances its polling offset, and duplicate updates do not repeat the underlying operation.
-- Outgoing messages use a database-backed delivery queue. Delivery is at-least-once: a lost send receipt can result in a duplicate message.
-- Deterministic code owns eligibility, allocation, and fallback. Optional Gemini ranking is disabled unless a key and explicit free-tier acknowledgement are configured.
+- Record the time you actually studied or skip a block. Completing a block does not automatically complete its topic.
+- Review study history, add or correct a past session, and explicitly complete or reopen topics. Changes are confirmed before they are applied.
+
+### What AI does today—and what is planned
+
+Optional Gemini can reorder eligible topics in a daily queue. Deterministic rules still enforce prerequisites, time limits, and allocation; Gemini does not create or assess the curriculum. [Issue #28](https://github.com/Jonathan0823/study-habit-engine/issues/28) tracks a future Telegram flow: describe your learning goal, review a proposed path and trusted-source links, then approve or reject it. This is not a current feature; ongoing AI tutoring is a separate idea.
 
 ## How planning works
 
@@ -192,7 +191,7 @@ The script starts a disposable PostgreSQL/API stack, runs Python and Rust tests,
 ## Architecture
 
 - **Rust Telegram bot:** polls Telegram, submits updates to the API, and sends queued responses.
-- **Python FastAPI service:** authenticates the bot and curriculum operator and handles study and curriculum operations.
+- **Python FastAPI service:** authenticates bot requests and curriculum-management requests and handles study operations.
 - **Python planning worker:** processes durable jobs, optionally requests a bounded Gemini ranking, uses deterministic validation, allocation, and fallback, and synchronizes optional Google Calendar reminders.
 - **PostgreSQL:** stores curriculum, progress, plans, jobs, operations, and pending deliveries.
 - **LangGraph:** provides the worker's graph/checkpoint structure; the optional Gemini ranking call runs within the planning path.
