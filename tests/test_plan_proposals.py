@@ -8,7 +8,11 @@ import pytest
 
 from app.db import apply_schema
 from app.plan_approval import decide_plan_proposal, parse_proposal_id
-from app.plan_jobs import process_one_learning_plan_job, reserve_tavily_credit
+from app.plan_jobs import (
+    format_plan_for_review,
+    process_one_learning_plan_job,
+    reserve_tavily_credit,
+)
 from app.plan_proposals import (
     PlanProposalError,
     PostgresPlanProposalRepository,
@@ -105,6 +109,27 @@ class FakeGenerator:
                 },
             ],
         }
+
+
+def test_approval_warnings_stay_with_approve_command_when_proposal_is_chunked():
+    proposal_id = uuid.uuid4()
+    sources = asyncio.run(FakeSearcher().search("Python"))
+    plan = asyncio.run(FakeGenerator().generate("Learn Python", {}, sources))
+    plan["topics"][0]["description"] = "x" * 6191
+
+    chunks = format_plan_for_review(proposal_id, plan)
+    assert len(chunks) > 1
+    warning_chunk = next(
+        chunk
+        for chunk in chunks
+        if "Approval replaces any currently active curriculum." in chunk
+    )
+
+    assert (
+        "Historical minutes remain with prior topic IDs; no completion is carried over."
+        in warning_chunk
+    )
+    assert f"/approve {proposal_id}" in warning_chunk
 
 
 class HallucinatingGenerator(FakeGenerator):

@@ -83,7 +83,10 @@ def format_plan_for_review(proposal_id: uuid.UUID | str, plan: dict) -> list[str
                 f"- {reference['title']}: {reference['url']}"
                 for reference in QUALITY_REFERENCES
             ],
-            "",
+        ]
+    )
+    approval_block = "\n".join(
+        [
             "This draft is not active until you approve it.",
             "Approval replaces any currently active curriculum.",
             "Historical minutes remain with prior topic IDs; no completion is carried over.",
@@ -105,7 +108,15 @@ def format_plan_for_review(proposal_id: uuid.UUID | str, plan: dict) -> list[str
         else:
             current = candidate
     if current:
-        chunks.append(current)
+        approval_candidate = f"{current}\n\n{approval_block}"
+        if len(approval_candidate) > 3800:
+            chunks.append(current)
+            current = approval_block
+        else:
+            current = approval_candidate
+    else:
+        current = approval_block
+    chunks.append(current)
     return chunks
 
 
