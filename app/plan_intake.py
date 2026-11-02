@@ -43,7 +43,7 @@ async def begin_learning_plan(
         if goal_too_long
         else "How many whole minutes can you study per week? Reply with a number from 1 to 10080 (for example, 300)."
         if goal
-        else "What do you want to learn? Include what you already know, and any deadline or language preference that matters."
+        else "Currently /learn supports programming and computer science only. What do you want to learn in that area? Include what you already know, and any deadline or language preference that matters."
     )
     await _deliver(
         conn,

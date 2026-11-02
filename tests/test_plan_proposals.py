@@ -36,6 +36,11 @@ class FakeSearcher:
         ]
 
 
+class NoTrustedSources:
+    async def search(self, query, *, max_results=5):
+        return []
+
+
 class FakeGenerator:
     async def generate(self, goal, context, sources):
         return {
@@ -139,9 +144,7 @@ def test_proposal_workflow_persists_only_a_valid_pending_draft():
     assert result["proposal_id"] == "proposal-123"
     assert result["status"] == "pending_review"
     assert len(repository.saved) == 1
-    assert repository.saved[0][1] == uuid.UUID(
-        "00000000-0000-0000-0000-000000000001"
-    )
+    assert repository.saved[0][1] == uuid.UUID("00000000-0000-0000-0000-000000000001")
     resource = repository.saved[0][4]["topics"][0]["resources"][0]
     assert resource["url"] == "https://docs.python.org/3/tutorial/"
     assert resource["title"] == "The Python Tutorial"
@@ -210,12 +213,8 @@ def test_postgres_proposal_save_is_pending_and_idempotent():
                     }
                 ],
             )
-            first = await repository.save_pending(
-                operation_id, goal, context, plan
-            )
-            replay = await repository.save_pending(
-                operation_id, goal, context, plan
-            )
+            first = await repository.save_pending(operation_id, goal, context, plan)
+            replay = await repository.save_pending(operation_id, goal, context, plan)
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT proposal_id,status FROM learning_plan_proposals"
@@ -275,9 +274,7 @@ def test_learning_plan_job_persists_proposal_and_enforces_search_cap():
                 generator=FakeGenerator(),
                 monthly_search_limit=1,
             )
-            allowed_replay = await reserve_tavily_credit(
-                pool, month_start, limit=1
-            )
+            allowed_replay = await reserve_tavily_credit(pool, month_start, limit=1)
             async with pool.acquire() as conn:
                 job = await conn.fetchrow(
                     "SELECT status,proposal_id FROM learning_plan_jobs WHERE operation_id=$1",
@@ -403,6 +400,14 @@ def test_learning_plan_job_persists_proposal_and_enforces_search_cap():
     assert "Python documentation" in rendered
     assert "Why it may help (AI rationale)" in rendered
     assert "AI self-review notes" in rendered
+    assert "Approval replaces any currently active curriculum." in rendered
+    assert (
+        "Historical minutes remain with prior topic IDs; no completion is carried over."
+        in rendered
+    )
+    assert rendered.index(
+        "Approval replaces any currently active curriculum."
+    ) < rendered.index("/approve ")
     assert "cmu.edu/teaching" in rendered
     assert credits == 1
     assert active_before is None
@@ -410,3 +415,69 @@ def test_learning_plan_job_persists_proposal_and_enforces_search_cap():
     assert final_proposal["curriculum_id"] == active_after
     assert version["status"] == "approved"
     assert rejected_status == "rejected"
+
+
+def test_no_trusted_sources_reports_current_scope_and_preserves_active_plan():
+    database_url = os.environ.get("MIGRATION_DATABASE_URL")
+    if not database_url:
+        pytest.skip("PostgreSQL integration test requires MIGRATION_DATABASE_URL")
+
+    operation_id = uuid.uuid4()
+
+    async def verify():
+        await apply_schema(database_url)
+        pool = await asyncpg.create_pool(database_url)
+        try:
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    "TRUNCATE learning_plan_jobs,learning_plan_sessions,learning_plan_proposals,tavily_search_usage,deliveries,operations CASCADE"
+                )
+                active_before = await conn.fetchval(
+                    "SELECT active_curriculum_id FROM engine_state WHERE singleton=true"
+                )
+                await conn.execute(
+                    "INSERT INTO operations(operation_id,source_key,request_hash,status,result) VALUES($1,$2,$3,'accepted','{}'::jsonb)",
+                    operation_id,
+                    f"unsupported-goal:{operation_id}",
+                    "request-hash",
+                )
+                await conn.execute(
+                    "INSERT INTO learning_plan_jobs(job_id,operation_id,goal,learner_context) VALUES($1,$2,$3,$4::jsonb)",
+                    uuid.uuid4(),
+                    operation_id,
+                    "Learn piano",
+                    '{"weekly_minutes":300}',
+                )
+            await process_one_learning_plan_job(
+                pool,
+                uuid.uuid4(),
+                searcher=NoTrustedSources(),
+                generator=FakeGenerator(),
+            )
+            async with pool.acquire() as conn:
+                job = await conn.fetchrow(
+                    "SELECT status,error_code FROM learning_plan_jobs WHERE operation_id=$1",
+                    operation_id,
+                )
+                proposal_count = await conn.fetchval(
+                    "SELECT count(*) FROM learning_plan_proposals WHERE operation_id=$1",
+                    operation_id,
+                )
+                message = await conn.fetchval(
+                    "SELECT payload->>'text' FROM deliveries WHERE operation_id=$1",
+                    operation_id,
+                )
+                active_after = await conn.fetchval(
+                    "SELECT active_curriculum_id FROM engine_state WHERE singleton=true"
+                )
+            return job, proposal_count, message, active_before, active_after
+        finally:
+            await pool.close()
+
+    job, proposal_count, message, active_before, active_after = asyncio.run(verify())
+    assert job["status"] == "failed"
+    assert job["error_code"] == "NO_TRUSTED_SOURCES"
+    assert proposal_count == 0
+    assert "programming and computer science" in message.lower()
+    assert "no curriculum was changed" in message.lower()
+    assert active_after == active_before

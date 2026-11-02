@@ -84,9 +84,11 @@ def format_plan_for_review(proposal_id: uuid.UUID | str, plan: dict) -> list[str
                 for reference in QUALITY_REFERENCES
             ],
             "",
+            "This draft is not active until you approve it.",
+            "Approval replaces any currently active curriculum.",
+            "Historical minutes remain with prior topic IDs; no completion is carried over.",
             f"Approve with /approve {proposal_id}",
             f"Reject with /reject {proposal_id}",
-            "This draft is not active until you approve it.",
         ]
     )
 
@@ -193,7 +195,12 @@ async def process_one_learning_plan_job(
                 error_code,
             )
             message = (
-                "I couldn't prepare a safe learning-plan proposal right now. "
+                "I couldn't find trusted sources in the current programming and "
+                "computer science catalog for that goal. /learn currently supports "
+                "programming and computer science only; no curriculum was changed. "
+                "Try a supported goal or add detail."
+                if error_code == "NO_TRUSTED_SOURCES"
+                else "I couldn't prepare a safe learning-plan proposal right now. "
                 "No curriculum was changed. Please try /learn again later."
             )
             await _insert_delivery(conn, job["operation_id"], "failure", message)
