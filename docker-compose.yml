@@ -58,6 +58,9 @@ services:
       GEMINI_FREE_TIER_ACKNOWLEDGED: ${GEMINI_FREE_TIER_ACKNOWLEDGED:-false}
       AI_MAX_INPUT_TOKENS: ${AI_MAX_INPUT_TOKENS:-8192}
       AI_MAX_OUTPUT_TOKENS: ${AI_MAX_OUTPUT_TOKENS:-512}
+      GOOGLE_CALENDAR_CREDENTIALS_FILE: /run/secrets/google-calendar.json
+    volumes:
+      - ${GOOGLE_CALENDAR_SECRET_DIR:-./secrets}:/run/secrets:ro
     depends_on:
       db:
         condition: service_healthy
