@@ -248,6 +248,24 @@ CREATE TABLE IF NOT EXISTS planning_job_operations (
 );
 CREATE INDEX IF NOT EXISTS planning_job_operations_job ON planning_job_operations(job_id);
 
+CREATE TABLE IF NOT EXISTS ai_attempts (
+    job_id uuid PRIMARY KEY REFERENCES planning_jobs(job_id),
+    study_date date NOT NULL,
+    month_start date NOT NULL,
+    provider text NOT NULL,
+    model text NOT NULL,
+    pricing_revision text NOT NULL,
+    reserved_usd numeric(12,6) NOT NULL CHECK (reserved_usd >= 0),
+    actual_usd numeric(12,6) CHECK (actual_usd >= 0),
+    status text NOT NULL CHECK (status IN ('dispatched','finished','uncertain')),
+    ranking jsonb,
+    error_code text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    finished_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS ai_attempts_daily_limit ON ai_attempts(study_date);
+CREATE INDEX IF NOT EXISTS ai_attempts_monthly_budget ON ai_attempts(month_start);
+
 CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id uuid PRIMARY KEY,
     logical_key text UNIQUE NOT NULL,

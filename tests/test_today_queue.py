@@ -716,3 +716,240 @@ def test_today_worker_commits_only_eligible_queue_and_outbox(today_client):
         "2. Arrays — 30 min",
         "Arrays resource: https://example.org/a",
     ]
+
+
+def test_model_ranking_changes_topic_priority_and_is_durably_recorded(today_client):
+    async def install_curriculum_and_cursor():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO telegram_cursor(bot_id,next_offset,poller_owner,fence,lease_until) VALUES(12345,0,$1,1,now()+interval '1 minute')",
+                uuid.uuid4(),
+            )
+            curriculum_id = uuid.uuid4()
+            topics = [
+                {
+                    "topic_id": topic_id,
+                    "title": topic_id.upper(),
+                    "description": f"Learn {topic_id}",
+                    "estimate_minutes": 90,
+                    "position": position,
+                    "prerequisites": [],
+                    "resources": [],
+                }
+                for position, topic_id in enumerate(("a", "b", "c"))
+            ]
+            await conn.execute(
+                "INSERT INTO curriculum_versions(curriculum_id,status,content_hash,content) VALUES($1,'approved',$2,$3::jsonb)",
+                curriculum_id,
+                f"test-{curriculum_id}",
+                json.dumps({"topics": topics}),
+            )
+            await conn.execute(
+                "UPDATE engine_state SET active_curriculum_id=$1 WHERE singleton=true",
+                curriculum_id,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(install_curriculum_and_cursor())
+    accepted = today_client.post(
+        "/v1/telegram/updates",
+        headers={"Authorization": "Bearer bot-secret"},
+        json=_today_payload(900000101),
+    )
+    assert accepted.status_code == 200
+    calls = 0
+
+    async def ranker(candidates):
+        nonlocal calls
+        calls += 1
+        assert {candidate["topic_id"] for candidate in candidates} == {"a", "b", "c"}
+        return {
+            "ranked_topics": [
+                {"topic_id": topic_id, "reason_code": "NO_PREREQUISITES"}
+                for topic_id in ("c", "b", "a")
+            ]
+        }
+
+    async def process_and_verify():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            async with pool.acquire() as conn:
+                job_id = await conn.fetchval("SELECT job_id FROM planning_jobs")
+            await process_job(pool, job_id, uuid.uuid4(), ranker=ranker)
+            async with pool.acquire() as conn:
+                blocks = await conn.fetch(
+                    "SELECT b.topic_id,b.planned_minutes FROM study_blocks b JOIN study_days d ON d.current_plan_id=b.plan_id ORDER BY b.position"
+                )
+                attempt = await conn.fetchrow(
+                    "SELECT status,provider,model,pricing_revision,reserved_usd,ranking FROM ai_attempts WHERE job_id=$1",
+                    job_id,
+                )
+            return blocks, attempt
+        finally:
+            await pool.close()
+
+    blocks, attempt = asyncio.run(process_and_verify())
+    assert calls == 1
+    assert [(row["topic_id"], row["planned_minutes"]) for row in blocks] == [
+        ("c", 30),
+        ("b", 30),
+    ]
+    assert attempt["status"] == "finished"
+    assert attempt["provider"] == "google_gemini"
+    assert attempt["reserved_usd"] == 0
+    assert json.loads(attempt["ranking"])["ranked_topics"][0]["topic_id"] == "c"
+
+
+def test_uncertain_gemini_dispatch_is_not_retried_after_worker_recovery(today_client):
+    async def setup_cursor():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO telegram_cursor(bot_id,next_offset,poller_owner,fence,lease_until) VALUES(12345,0,$1,1,now()+interval '1 minute')",
+                uuid.uuid4(),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup_cursor())
+    accepted = today_client.post(
+        "/v1/telegram/updates",
+        headers={"Authorization": "Bearer bot-secret"},
+        json=_today_payload(900000102),
+    )
+    assert accepted.status_code == 200
+    calls = 0
+
+    async def interrupted_ranker(_candidates):
+        nonlocal calls
+        calls += 1
+        raise asyncio.CancelledError()
+
+    async def recover_and_verify():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            async with pool.acquire() as conn:
+                job_id = await conn.fetchval("SELECT job_id FROM planning_jobs")
+            with pytest.raises(asyncio.CancelledError):
+                await process_job(pool, job_id, uuid.uuid4(), ranker=interrupted_ranker)
+            async with pool.acquire() as conn:
+                status = await conn.fetchval(
+                    "SELECT status FROM ai_attempts WHERE job_id=$1", job_id
+                )
+                await conn.execute(
+                    "UPDATE planning_jobs SET lease_until=now()-interval '1 second' WHERE job_id=$1",
+                    job_id,
+                )
+            assert status == "dispatched"
+
+            async def must_not_retry(_candidates):
+                nonlocal calls
+                calls += 1
+                raise AssertionError("uncertain dispatch must not be repeated")
+
+            await process_job(pool, job_id, uuid.uuid4(), ranker=must_not_retry)
+            async with pool.acquire() as conn:
+                attempt = await conn.fetchrow(
+                    "SELECT status,error_code,ranking FROM ai_attempts WHERE job_id=$1",
+                    job_id,
+                )
+                plan_count = await conn.fetchval("SELECT count(*) FROM plans")
+            return attempt, plan_count
+        finally:
+            await pool.close()
+
+    attempt, plan_count = asyncio.run(recover_and_verify())
+    assert calls == 1
+    assert attempt["status"] == "dispatched"
+    assert attempt["ranking"] is None
+    assert plan_count == 1
+
+
+@pytest.mark.parametrize(("prior_count", "prior_reserved_usd"), [(10, 0), (1, 0.000001)])
+def test_ai_budget_falls_back_without_an_extra_dispatch(
+    today_client, prior_count, prior_reserved_usd
+):
+    async def setup_cursor():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "INSERT INTO telegram_cursor(bot_id,next_offset,poller_owner,fence,lease_until) VALUES(12345,0,$1,1,now()+interval '1 minute')",
+                uuid.uuid4(),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup_cursor())
+    accepted = today_client.post(
+        "/v1/telegram/updates",
+        headers={"Authorization": "Bearer bot-secret"},
+        json=_today_payload(900000103),
+    )
+    assert accepted.status_code == 200
+    study_date = datetime.now(ZoneInfo("Asia/Jakarta")).date()
+
+    async def seed_daily_limit():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            for _ in range(prior_count):
+                operation_id, prior_job_id = uuid.uuid4(), uuid.uuid4()
+                await conn.execute(
+                    "INSERT INTO operations(operation_id,source_key,request_hash,status,result) VALUES($1,$2,$3,'completed','{}'::jsonb)",
+                    operation_id,
+                    f"seed-ai-limit:{prior_job_id}",
+                    str(prior_job_id),
+                )
+                await conn.execute(
+                    "INSERT INTO planning_jobs(job_id,operation_id,study_date,generation,status) VALUES($1,$2,$3,$4,'completed')",
+                    prior_job_id,
+                    operation_id,
+                    study_date,
+                    100 + _,
+                )
+                await conn.execute(
+                    "INSERT INTO ai_attempts(job_id,study_date,month_start,provider,model,pricing_revision,reserved_usd,status) VALUES($1,$2,$3,'google_gemini','gemini-test','test',$4,'finished')",
+                    prior_job_id,
+                    study_date,
+                    study_date.replace(day=1),
+                    prior_reserved_usd,
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(seed_daily_limit())
+    calls = 0
+
+    async def forbidden_ranker(_candidates):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("the daily call budget is already exhausted")
+
+    async def process_and_verify():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            async with pool.acquire() as conn:
+                job_id = await conn.fetchval(
+                    "SELECT job_id FROM planning_jobs WHERE operation_id=$1",
+                    uuid.UUID(accepted.json()["operation_id"]),
+                )
+            await process_job(pool, job_id, uuid.uuid4(), ranker=forbidden_ranker)
+            async with pool.acquire() as conn:
+                attempt_count = await conn.fetchval(
+                    "SELECT count(*) FROM ai_attempts WHERE job_id=$1", job_id
+                )
+                blocks = await conn.fetch(
+                    "SELECT b.topic_id,b.planned_minutes FROM study_blocks b JOIN study_days d ON d.current_plan_id=b.plan_id ORDER BY b.position"
+                )
+            return attempt_count, blocks
+        finally:
+            await pool.close()
+
+    attempt_count, blocks = asyncio.run(process_and_verify())
+    assert calls == 0
+    assert attempt_count == 0
+    assert [(row["topic_id"], row["planned_minutes"]) for row in blocks] == [
+        ("a", 30),
+        ("a", 30),
+    ]
