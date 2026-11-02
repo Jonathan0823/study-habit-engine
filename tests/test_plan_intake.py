@@ -15,7 +15,16 @@ from app.plan_proposals import PostgresPlanProposalRepository
 
 @pytest.mark.parametrize(
     ("text", "expected"),
-    [("300", 300), ("1", 1), ("10080", 10080), ("0", None), ("10081", None), ("3.5", None), ("٣٠٠", None), ("five", None)],
+    [
+        ("300", 300),
+        ("1", 1),
+        ("10080", 10080),
+        ("0", None),
+        ("10081", None),
+        ("3.5", None),
+        ("٣٠٠", None),
+        ("five", None),
+    ],
 )
 def test_weekly_minutes_requires_ascii_whole_number_in_bounds(text, expected):
     assert parse_weekly_minutes(text) == expected
@@ -107,7 +116,11 @@ def test_goal_to_plan_intake_persists_one_job_after_goal_and_time_budget(client)
     started = client.post("/v1/telegram/updates", json=start, headers=headers)
     assert started.status_code == 200
     assert started.json()["status"] == "accepted"
-    assert "What do you want to learn?" in delivered_text(
+    assert (
+        "programming and computer science"
+        in delivered_text(client, started.json()["operation_id"]).lower()
+    )
+    assert "What do you want to learn in that area?" in delivered_text(
         client, started.json()["operation_id"]
     )
 
@@ -121,9 +134,10 @@ def test_goal_to_plan_intake_persists_one_job_after_goal_and_time_budget(client)
     )
     assert goal_response.status_code == 200
     assert goal_response.json()["status"] == "completed"
-    assert "minutes can you study per week" in delivered_text(
-        client, goal_response.json()["operation_id"]
-    ).lower()
+    assert (
+        "minutes can you study per week"
+        in delivered_text(client, goal_response.json()["operation_id"]).lower()
+    )
 
     budget_update = telegram_update(
         new_update_id(),
@@ -144,7 +158,9 @@ def test_goal_to_plan_intake_persists_one_job_after_goal_and_time_budget(client)
             jobs = await conn.fetch(
                 "SELECT operation_id,goal,learner_context,status FROM learning_plan_jobs"
             )
-            sessions = await conn.fetchval("SELECT count(*) FROM learning_plan_sessions")
+            sessions = await conn.fetchval(
+                "SELECT count(*) FROM learning_plan_sessions"
+            )
             proposals = await conn.fetchval(
                 "SELECT count(*) FROM learning_plan_proposals"
             )
@@ -320,7 +336,9 @@ def test_telegram_approval_activates_and_rejection_preserves_active_curriculum(
     missing_id = client.post(
         "/v1/telegram/updates",
         json=telegram_update(
-            new_update_id(), fence, {"kind": "command", "command": "approve", "arguments": []}
+            new_update_id(),
+            fence,
+            {"kind": "command", "command": "approve", "arguments": []},
         ),
         headers=headers,
     )

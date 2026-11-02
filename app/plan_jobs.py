@@ -83,10 +83,15 @@ def format_plan_for_review(proposal_id: uuid.UUID | str, plan: dict) -> list[str
                 f"- {reference['title']}: {reference['url']}"
                 for reference in QUALITY_REFERENCES
             ],
-            "",
+        ]
+    )
+    approval_block = "\n".join(
+        [
+            "This draft is not active until you approve it.",
+            "Approval replaces any currently active curriculum.",
+            "Historical minutes remain with prior topic IDs; no completion is carried over.",
             f"Approve with /approve {proposal_id}",
             f"Reject with /reject {proposal_id}",
-            "This draft is not active until you approve it.",
         ]
     )
 
@@ -103,7 +108,15 @@ def format_plan_for_review(proposal_id: uuid.UUID | str, plan: dict) -> list[str
         else:
             current = candidate
     if current:
-        chunks.append(current)
+        approval_candidate = f"{current}\n\n{approval_block}"
+        if len(approval_candidate) > 3800:
+            chunks.append(current)
+            current = approval_block
+        else:
+            current = approval_candidate
+    else:
+        current = approval_block
+    chunks.append(current)
     return chunks
 
 
@@ -193,7 +206,12 @@ async def process_one_learning_plan_job(
                 error_code,
             )
             message = (
-                "I couldn't prepare a safe learning-plan proposal right now. "
+                "I couldn't find trusted sources in the current programming and "
+                "computer science catalog for that goal. /learn currently supports "
+                "programming and computer science only; no curriculum was changed. "
+                "Try a supported goal or add detail."
+                if error_code == "NO_TRUSTED_SOURCES"
+                else "I couldn't prepare a safe learning-plan proposal right now. "
                 "No curriculum was changed. Please try /learn again later."
             )
             await _insert_delivery(conn, job["operation_id"], "failure", message)

@@ -10,7 +10,7 @@ Record the time you actually study, mark topics complete when you have finished 
 
 ### Choose what to learn
 
-- Choose a subject and review a curriculum of topics, prerequisites, objectives, and learning resources. Provide one yourself or use `/learn` to generate an AI-drafted proposal with self-review notes; review and approve it before activation. The app does not certify a plan's teaching quality.
+- Choose a subject and review a curriculum of topics, prerequisites, objectives, and learning resources. Provide one yourself or use `/learn` to generate an AI-drafted proposal for programming and computer science; review and approve it before activation. The app does not certify a plan's teaching quality.
 - Preview a curriculum's effects on completed topics and existing queues before activating it.
 - When changing topic identities, map completed topics explicitly so that progress is not silently reassigned.
 
@@ -27,7 +27,7 @@ Record the time you actually study, mark topics complete when you have finished 
 
 ### What AI does today—and what is planned
 
-Optional Gemini can reorder eligible topics in a daily queue. Deterministic rules still enforce prerequisites, time limits, and allocation. The goal-based learning-plan flow from [issue #28](https://github.com/Jonathan0823/study-habit-engine/issues/28) is now available in Telegram: use `/learn`, describe your goal and weekly study time, review the sourced proposal and clearly labeled AI self-review notes, then `/approve <proposal_id>` to activate it or `/reject <proposal_id>` to leave your active plan unchanged. The self-review is guidance, not proof of effectiveness; see the [quality-review rubric](docs/design/learning-plan-quality-rubric.md). Ongoing AI tutoring is a separate idea.
+Optional Gemini can reorder eligible topics in a daily queue. Deterministic rules still enforce prerequisites, time limits, and allocation. The goal-based learning-plan flow from [issue #28](https://github.com/Jonathan0823/study-habit-engine/issues/28) is now available in Telegram for programming and computer-science goals, using a small trusted-source catalog. Use `/learn`, describe your goal and weekly study time, review the sourced proposal and clearly labeled AI self-review notes, then `/approve <proposal_id>` to activate it or `/reject <proposal_id>` to leave your active plan unchanged. Goals with no sources in the current catalog are declined without changing the active curriculum. The self-review is guidance, not proof of effectiveness; see the [quality-review rubric](docs/design/learning-plan-quality-rubric.md). Ongoing AI tutoring is a separate idea.
 
 ## How planning works
 
@@ -49,7 +49,7 @@ The worker checks for the current day's routine plan at 17:00 Asia/Jakarta. It r
 | `/budget [minutes]` | Set today's planning budget to 0–90 minutes. With no argument, the bot prompts you. |
 | `/replan` | Request a replacement for today's unfinished queue. |
 | `/progress [date or action]` | Review history, add or correct a session, or reopen a topic. Dates use `YYYY-MM-DD` in `Asia/Jakarta`. |
-| `/learn` | Start a guided learning-plan proposal; reply with your goal, then weekly study minutes. |
+| `/learn` | Start a guided programming/computer-science learning-plan proposal; reply with your goal, then weekly study minutes. |
 | `/approve <proposal_id>` | Approve and activate the reviewed learning plan. |
 | `/reject <proposal_id>` | Reject the proposal without changing your active learning plan. |
 
@@ -217,7 +217,7 @@ docs/agents/          Contributor and agent workflow guidance
 ## Scope and limitations
 
 - The first version is for one authorized Telegram user, not a multi-user service.
-- `/learn` can generate an AI-drafted curriculum proposal with self-review notes for you to review and approve. The app does not certify a plan's teaching quality or treat its self-review as proof.
+- `/learn` is initially limited to programming and computer science because its exact-host trusted-source catalog is intentionally small. Goals without trusted sources are declined without changing the active curriculum. The app does not certify a plan's teaching quality or treat AI self-review notes as proof.
 - Optional Gemini ranking is disabled by default and only reorders topics eligible for today's queue. `/learn` separately drafts a curriculum proposal; neither feature allocates study blocks, which remain deterministic.
 - Production readiness, backup and restore, external monitoring, and operational recovery have not been established or verified.
 - Telegram retains incoming updates for a limited time. A prolonged outage can mean an update was never accepted; recovery of every command is not guaranteed.
