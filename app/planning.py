@@ -6,13 +6,21 @@ import asyncio
 import json
 import os
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 import asyncpg
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
+
+from app.ranking import (
+    configured_gemini_ranker,
+    max_input_token_limit,
+    ranking_input_fits,
+    validate_ranking,
+)
 
 JAKARTA = ZoneInfo("Asia/Jakarta")
 
@@ -24,12 +32,15 @@ class Candidate(TypedDict):
     prerequisites: list[str]
     completed_prerequisites: list[str]
     started_minutes: int
+    title: str
+    description: str
 
 
 def allocate(
     candidates: list[Candidate],
     capacity: int,
     skipped_topic_ids: set[str] | None = None,
+    ranking_order: list[str] | None = None,
 ) -> list[dict]:
     """Allocate 30-minute blocks in repeated passes; never create work or filler."""
     capacity = max(0, min(90, capacity))
@@ -40,9 +51,15 @@ def allocate(
         if item["topic_id"] not in skipped_topic_ids
         and set(item["prerequisites"]) <= set(item["completed_prerequisites"])
     ]
+    rank_positions = (
+        {topic_id: index for index, topic_id in enumerate(ranking_order)}
+        if ranking_order is not None
+        else {}
+    )
     eligible.sort(
         key=lambda item: (
             item["started_minutes"] <= 0,
+            rank_positions.get(item["topic_id"], item["position"]),
             item["position"],
             item["topic_id"],
         )
@@ -83,8 +100,50 @@ def build_graph(checkpointer, pool: asyncpg.Pool, owner: uuid.UUID):
     return graph.compile(checkpointer=checkpointer)
 
 
-async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -> None:
-    """Claim, snapshot, allocate, and atomically commit plan plus delivery."""
+async def process_job(
+    pool: asyncpg.Pool,
+    job_id: uuid.UUID,
+    owner: uuid.UUID,
+    *,
+    ranker=None,
+) -> None:
+    """Claim once, optionally rank outside transactions, then revalidate and commit."""
+    if ranker is None:
+        try:
+            ranker = configured_gemini_ranker()
+        except Exception:
+            ranker = None
+    prepared = await _claim_and_reserve_ai(pool, job_id, owner, ranker)
+    if prepared is None:
+        return
+    fence, candidates, saved_ranking, dispatch = prepared
+    ranking_response = saved_ranking
+    if dispatch and ranker is not None:
+        try:
+            response = await asyncio.wait_for(ranker(candidates), timeout=10)
+            valid = validate_ranking(candidates, response)
+            if valid is None:
+                await _finish_ai_attempt(pool, job_id, None, "INVALID_RANKING", uncertain=False)
+            else:
+                ranking_response = _canonical_ranking_response(response)
+                await _finish_ai_attempt(pool, job_id, ranking_response, None, uncertain=False)
+        except Exception:
+            await _finish_ai_attempt(pool, job_id, None, "PROVIDER_UNAVAILABLE", uncertain=True)
+    await _commit_claimed_job(pool, job_id, owner, fence, ranking_response)
+
+
+def _canonical_ranking_response(response):
+    if hasattr(response, "model_dump"):
+        response = response.model_dump(exclude_none=True)
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except json.JSONDecodeError:
+            return None
+    return response if isinstance(response, dict) else None
+
+
+async def _claim_and_reserve_ai(pool, job_id, owner, ranker):
     async with pool.acquire() as conn, conn.transaction():
         job = await conn.fetchrow(
             """SELECT * FROM planning_jobs WHERE job_id=$1 AND
@@ -92,7 +151,7 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
             job_id,
         )
         if job is None:
-            return
+            return None
         fence = job["fence"] + 1
         await conn.execute(
             "UPDATE planning_jobs SET status='running',lease_owner=$2,fence=$3,lease_until=now()+interval '60 seconds' WHERE job_id=$1",
@@ -100,6 +159,162 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
             owner,
             fence,
         )
+        today = job["study_date"]
+        state = await conn.fetchrow(
+            "SELECT active_curriculum_id FROM engine_state WHERE singleton=true FOR UPDATE"
+        )
+        day = await conn.fetchrow(
+            "SELECT * FROM study_days WHERE study_date=$1 FOR UPDATE", today
+        )
+        if (
+            job["generation"] != day["requested_generation"]
+            or today != datetime.now(JAKARTA).date()
+            or state is None
+            or state["active_curriculum_id"] is None
+        ):
+            return fence, [], None, False
+        curriculum = await conn.fetchrow(
+            "SELECT status,content FROM curriculum_versions WHERE curriculum_id=$1",
+            state["active_curriculum_id"],
+        )
+        if curriculum is None or curriculum["status"] != "approved":
+            return fence, [], None, False
+        content = curriculum["content"]
+        if isinstance(content, str):
+            content = json.loads(content)
+        actual, completed, skipped, candidates = await _candidate_snapshot(
+            conn, today, content
+        )
+        eligible = [
+            candidate
+            for candidate in candidates
+            if candidate["topic_id"] not in skipped
+            and set(candidate["prerequisites"])
+            <= set(candidate["completed_prerequisites"])
+        ]
+        input_limit = max_input_token_limit()
+        if (
+            not eligible
+            or day["budget_minutes"] - actual < 15
+            or input_limit is None
+            or not ranking_input_fits(eligible, input_limit)
+        ):
+            return fence, eligible, None, False
+
+        attempt = await conn.fetchrow(
+            "SELECT status,ranking FROM ai_attempts WHERE job_id=$1 FOR UPDATE", job_id
+        )
+        if attempt is not None:
+            ranking = attempt["ranking"]
+            if isinstance(ranking, str):
+                ranking = json.loads(ranking)
+            return fence, eligible, ranking if attempt["status"] == "finished" else None, False
+        if ranker is None:
+            return fence, eligible, None, False
+
+        # Locking engine_state serializes daily and monthly reservations. Only
+        # free-tier calls have a nonpositive price; paid spillover is never allowed.
+        limits = await conn.fetchrow(
+            """SELECT count(*)::int AS calls, coalesce(sum(reserved_usd),0) AS reserved
+               FROM ai_attempts WHERE study_date=$1""",
+            today,
+        )
+        month_start = date(today.year, today.month, 1)
+        monthly_reserved = await conn.fetchval(
+            "SELECT coalesce(sum(reserved_usd),0) FROM ai_attempts WHERE month_start=$1",
+            month_start,
+        )
+        if limits["calls"] >= 10 or Decimal(monthly_reserved) > Decimal("0"):
+            return fence, eligible, None, False
+
+        await conn.execute(
+            """INSERT INTO ai_attempts(
+                   job_id,study_date,month_start,provider,model,pricing_revision,
+                   reserved_usd,status)
+               VALUES($1,$2,$3,'google_gemini',$4,'gemini-free-tier-v1',0,'dispatched')""",
+            job_id,
+            today,
+            month_start,
+            os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+        )
+        return fence, eligible, None, True
+
+
+async def _candidate_snapshot(conn, today, content):
+    sessions = await conn.fetch(
+        "SELECT topic_id,sum(actual_minutes)::int AS minutes FROM study_sessions WHERE study_date=$1 GROUP BY topic_id",
+        today,
+    )
+    actual = sum(row["minutes"] for row in sessions)
+    history = await conn.fetch(
+        "SELECT topic_id,sum(actual_minutes)::int AS minutes FROM study_sessions GROUP BY topic_id"
+    )
+    started = {row["topic_id"]: row["minutes"] for row in history if row["minutes"] > 0}
+    progress_minutes = await conn.fetch(
+        "SELECT topic_id,study_minutes FROM topic_progress WHERE study_minutes > 0"
+    )
+    started.update(
+        {
+            row["topic_id"]: max(started.get(row["topic_id"], 0), row["study_minutes"])
+            for row in progress_minutes
+        }
+    )
+    completed_rows = await conn.fetch(
+        "SELECT topic_id FROM topic_progress WHERE completed=true"
+    )
+    completed = {row["topic_id"] for row in completed_rows}
+    skipped_rows = await conn.fetch(
+        "SELECT DISTINCT b.topic_id FROM study_blocks b JOIN plans p USING(plan_id) WHERE p.study_date=$1 AND b.status='skipped'",
+        today,
+    )
+    skipped = {row["topic_id"] for row in skipped_rows}
+    candidates = [
+        {
+            "topic_id": topic["topic_id"],
+            "title": topic["title"],
+            "description": topic["description"],
+            "position": topic["position"],
+            "estimate_minutes": topic["estimate_minutes"],
+            "prerequisites": topic["prerequisites"],
+            "completed_prerequisites": sorted(completed),
+            "started_minutes": started.get(topic["topic_id"], 0),
+        }
+        for topic in content["topics"]
+        if topic["topic_id"] not in completed
+    ]
+    return actual, completed, skipped, candidates
+
+
+async def _finish_ai_attempt(pool, job_id, ranking, error_code, *, uncertain):
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """UPDATE ai_attempts SET status=$2,ranking=$3::jsonb,error_code=$4,
+                   actual_usd=0,finished_at=now()
+               WHERE job_id=$1 AND status='dispatched'""",
+            job_id,
+            "uncertain" if uncertain else "finished",
+            json.dumps(ranking) if ranking is not None else None,
+            error_code,
+        )
+
+
+async def _commit_claimed_job(
+    pool: asyncpg.Pool,
+    job_id: uuid.UUID,
+    owner: uuid.UUID,
+    fence: int,
+    ranking_response: dict | None,
+) -> None:
+    """Re-snapshot and atomically commit only for the current lease owner."""
+    async with pool.acquire() as conn, conn.transaction():
+        job = await conn.fetchrow(
+            "SELECT * FROM planning_jobs WHERE job_id=$1 AND status='running' AND lease_owner=$2 AND fence=$3 AND lease_until > now() FOR UPDATE",
+            job_id,
+            owner,
+            fence,
+        )
+        if job is None:
+            return
         today = job["study_date"]
         state = await conn.fetchrow(
             "SELECT active_curriculum_id,state_revision FROM engine_state WHERE singleton=true FOR UPDATE"
@@ -149,49 +364,26 @@ async def process_job(pool: asyncpg.Pool, job_id: uuid.UUID, owner: uuid.UUID) -
         content = curriculum["content"]
         if isinstance(content, str):
             content = json.loads(content)
-        sessions = await conn.fetch(
-            "SELECT topic_id,sum(actual_minutes)::int AS minutes FROM study_sessions WHERE study_date=$1 GROUP BY topic_id",
-            today,
+        actual, completed, skipped_topic_ids, candidates = await _candidate_snapshot(
+            conn, today, content
         )
-        actual = sum(r["minutes"] for r in sessions)
-        history = await conn.fetch(
-            "SELECT topic_id,sum(actual_minutes)::int AS minutes FROM study_sessions GROUP BY topic_id"
-        )
-        started = {r["topic_id"]: r["minutes"] for r in history if r["minutes"] > 0}
-        progress_minutes = await conn.fetch(
-            "SELECT topic_id,study_minutes FROM topic_progress WHERE study_minutes > 0"
-        )
-        started.update(
-            {
-                r["topic_id"]: max(started.get(r["topic_id"], 0), r["study_minutes"])
-                for r in progress_minutes
-            }
-        )
-        completed_rows = await conn.fetch(
-            "SELECT topic_id FROM topic_progress WHERE completed=true"
-        )
-        completed = {r["topic_id"] for r in completed_rows}
-        skipped_rows = await conn.fetch(
-            "SELECT DISTINCT b.topic_id FROM study_blocks b JOIN plans p USING(plan_id) WHERE p.study_date=$1 AND b.status='skipped'",
-            today,
-        )
-        skipped_topic_ids = {r["topic_id"] for r in skipped_rows}
-        candidates = [
-            {
-                "topic_id": t["topic_id"],
-                "position": t["position"],
-                "estimate_minutes": t["estimate_minutes"],
-                "prerequisites": t["prerequisites"],
-                "completed_prerequisites": list(completed),
-                "started_minutes": started.get(t["topic_id"], 0),
-            }
-            for t in content["topics"]
-            if t["topic_id"] not in completed
+        rankable = [
+            candidate
+            for candidate in candidates
+            if candidate["topic_id"] not in skipped_topic_ids
+            and set(candidate["prerequisites"])
+            <= set(candidate["completed_prerequisites"])
         ]
+        ranking_order = (
+            validate_ranking(rankable, ranking_response)
+            if ranking_response is not None
+            else None
+        )
         blocks = allocate(
             candidates,
             min(day["budget_minutes"], 90) - actual,
             skipped_topic_ids,
+            ranking_order,
         )
         if not blocks:
             eligible = any(

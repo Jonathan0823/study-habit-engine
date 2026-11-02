@@ -53,6 +53,11 @@ services:
     command: ["uv", "run", "python", "-m", "app.planning"]
     environment:
       DATABASE_URL: postgresql://study_runtime:study-runtime-local@db:5432/study
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      GEMINI_FREE_TIER_ACKNOWLEDGED: ${GEMINI_FREE_TIER_ACKNOWLEDGED:-false}
+      AI_MAX_INPUT_TOKENS: ${AI_MAX_INPUT_TOKENS:-8192}
+      AI_MAX_OUTPUT_TOKENS: ${AI_MAX_OUTPUT_TOKENS:-512}
     depends_on:
       db:
         condition: service_healthy
