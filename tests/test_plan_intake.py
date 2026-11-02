@@ -209,6 +209,38 @@ def test_telegram_approval_activates_and_rejection_preserves_active_curriculum(c
                         ],
                     }
                 ],
+                "quality_review": [
+                    {
+                        "criterion": "goal_coverage",
+                        "evidence": "The outcome is covered by the Python topic.",
+                        "topic_ids": [f"topic-{label}"],
+                        "outcome_ids": ["write-program"],
+                    },
+                    {
+                        "criterion": "objective_assessment_alignment",
+                        "evidence": "The build task assesses the outcome.",
+                        "topic_ids": [f"topic-{label}"],
+                        "outcome_ids": ["write-program"],
+                    },
+                    {
+                        "criterion": "topic_sequence",
+                        "evidence": "The topic has no unmet prerequisites.",
+                        "topic_ids": [f"topic-{label}"],
+                        "outcome_ids": [],
+                    },
+                    {
+                        "criterion": "practice_and_retrieval",
+                        "evidence": "The implementation task requires active practice.",
+                        "topic_ids": [f"topic-{label}"],
+                        "outcome_ids": [],
+                    },
+                    {
+                        "criterion": "scope_and_workload",
+                        "evidence": "The estimate fits the weekly budget.",
+                        "topic_ids": [f"topic-{label}"],
+                        "outcome_ids": [],
+                    },
+                ],
             }
             repository = PostgresPlanProposalRepository(pool)
             return await repository.save_pending(

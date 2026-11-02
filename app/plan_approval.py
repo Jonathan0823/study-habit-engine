@@ -7,6 +7,8 @@ import json
 import uuid
 
 from app.curriculum import Curriculum, canonical_content, curriculum_impact
+from app.learning_plans import validate_learning_plan
+from app.trusted_sources import SOFTWARE_CS_TRUSTED_HOSTS
 
 
 def parse_proposal_id(arguments: list[str]) -> uuid.UUID | None:
@@ -102,6 +104,23 @@ async def decide_plan_proposal(
             operation_id,
             "PLAN_PROPOSAL_CONTENT_HASH_MISMATCH",
             "I couldn't verify that proposal's saved contents, so it was not activated.",
+        )
+        return
+    errors = validate_learning_plan(
+        plan,
+        trusted_hosts=set(SOFTWARE_CS_TRUSTED_HOSTS),
+        weekly_minutes=(
+            learner_context.get("weekly_minutes")
+            if isinstance(learner_context, dict)
+            else None
+        ),
+    )
+    if errors:
+        await _finish(
+            conn,
+            operation_id,
+            "PLAN_PROPOSAL_FAILED_VALIDATION",
+            "That proposal no longer passes the deterministic safety checks, so it was not activated.",
         )
         return
     content = _curriculum_content(plan)

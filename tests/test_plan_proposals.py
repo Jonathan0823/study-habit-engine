@@ -67,6 +67,38 @@ class FakeGenerator:
                     ],
                 }
             ],
+            "quality_review": [
+                {
+                    "criterion": "goal_coverage",
+                    "evidence": "The stated outcome is covered by the Python topic.",
+                    "topic_ids": ["python-basics"],
+                    "outcome_ids": ["write-python"],
+                },
+                {
+                    "criterion": "objective_assessment_alignment",
+                    "evidence": "The implementation task assesses the outcome.",
+                    "topic_ids": ["python-basics"],
+                    "outcome_ids": ["write-python"],
+                },
+                {
+                    "criterion": "topic_sequence",
+                    "evidence": "The foundational topic has no unmet prerequisites.",
+                    "topic_ids": ["python-basics"],
+                    "outcome_ids": [],
+                },
+                {
+                    "criterion": "practice_and_retrieval",
+                    "evidence": "The topic includes recall before independent coding.",
+                    "topic_ids": ["python-basics"],
+                    "outcome_ids": [],
+                },
+                {
+                    "criterion": "scope_and_workload",
+                    "evidence": "The estimate fits the supplied weekly budget.",
+                    "topic_ids": ["python-basics"],
+                    "outcome_ids": [],
+                },
+            ],
         }
 
 
@@ -366,7 +398,12 @@ def test_learning_plan_job_persists_proposal_and_enforces_search_cap():
     assert proposal["status"] == "pending_review"
     assert operation["status"] == "completed"
     assert len(messages) >= 1
-    assert any("/approve " in row["payload"] for row in messages)
+    rendered = " ".join(row["payload"] for row in messages)
+    assert "/approve " in rendered
+    assert "Python documentation" in rendered
+    assert "Why it may help (AI rationale)" in rendered
+    assert "AI self-review notes" in rendered
+    assert "cmu.edu/teaching" in rendered
     assert credits == 1
     assert active_before is None
     assert final_proposal["status"] == "approved"

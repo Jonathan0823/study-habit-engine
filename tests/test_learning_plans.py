@@ -31,6 +31,38 @@ def valid_plan():
                 ],
             }
         ],
+        "quality_review": [
+            {
+                "criterion": "goal_coverage",
+                "evidence": "The Python outcome is covered by the foundational topic.",
+                "topic_ids": ["python-basics"],
+                "outcome_ids": ["write-python"],
+            },
+            {
+                "criterion": "objective_assessment_alignment",
+                "evidence": "The implementation assessment measures the stated outcome.",
+                "topic_ids": ["python-basics"],
+                "outcome_ids": ["write-python"],
+            },
+            {
+                "criterion": "topic_sequence",
+                "evidence": "The foundational topic has no unmet prerequisites.",
+                "topic_ids": ["python-basics"],
+                "outcome_ids": [],
+            },
+            {
+                "criterion": "practice_and_retrieval",
+                "evidence": "The topic uses retrieval before independent coding practice.",
+                "topic_ids": ["python-basics"],
+                "outcome_ids": [],
+            },
+            {
+                "criterion": "scope_and_workload",
+                "evidence": "The estimated effort fits within the learner's budget.",
+                "topic_ids": ["python-basics"],
+                "outcome_ids": [],
+            },
+        ],
     }
 
 
@@ -51,6 +83,26 @@ def test_malformed_prerequisite_values_are_rejected_without_crashing():
         trusted_hosts={"docs.python.org"},
         weekly_minutes=300,
     )
+
+
+def test_quality_review_must_cover_each_criterion_and_valid_plan_ids():
+    plan = valid_plan()
+    plan["quality_review"] = plan["quality_review"][:-1]
+    errors = validate_learning_plan(
+        plan,
+        trusted_hosts={"docs.python.org"},
+        weekly_minutes=300,
+    )
+    assert "INVALID_QUALITY_REVIEW" in errors
+
+    plan = valid_plan()
+    plan["quality_review"][0]["topic_ids"] = [{"unhashable": "value"}]
+    errors = validate_learning_plan(
+        plan,
+        trusted_hosts={"docs.python.org"},
+        weekly_minutes=300,
+    )
+    assert "INVALID_QUALITY_REVIEW_TOPICS" in errors
 
 
 def test_resource_host_must_match_allowlist_exactly():

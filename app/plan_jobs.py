@@ -7,6 +7,7 @@ import textwrap
 import uuid
 from datetime import datetime, timezone
 
+from app.learning_plans import QUALITY_REFERENCES
 from app.plan_proposals import (
     PlanProposalError,
     PostgresPlanProposalRepository,
@@ -44,6 +45,16 @@ def format_plan_for_review(proposal_id: uuid.UUID | str, plan: dict) -> list[str
     ]
     for outcome in plan["outcomes"]:
         lines.append(f"- {outcome['description']} (check: {outcome['assessment']})")
+    lines.extend(["", "AI self-review notes (not independently verified):"])
+    for item in plan["quality_review"]:
+        criterion = item["criterion"].replace("_", " ").title()
+        lines.append(f"- {criterion}: {item['evidence']}")
+        lines.append(
+            "  Related topics: "
+            + ", ".join(item["topic_ids"])
+            + "; outcomes: "
+            + (", ".join(item["outcome_ids"]) or "not applicable")
+        )
     lines.extend(["", "Study topics:"])
     for index, topic in enumerate(plan["topics"], start=1):
         prerequisites = ", ".join(topic["prerequisites"]) or "none"
@@ -56,9 +67,22 @@ def format_plan_for_review(proposal_id: uuid.UUID | str, plan: dict) -> list[str
             ]
         )
         for resource in topic["resources"]:
-            lines.append(f"   Source: {resource['title']} — {resource['url']}")
+            lines.extend(
+                [
+                    f"   Suggested source: {resource['title']} — {resource['publisher']}",
+                    f"   Link: {resource['url']}",
+                    f"   Why it may help (AI rationale): {resource['rationale']}",
+                    "   Suggestion only; this is not a verified endorsement.",
+                ]
+            )
     lines.extend(
         [
+            "",
+            "Review references:",
+            *[
+                f"- {reference['title']}: {reference['url']}"
+                for reference in QUALITY_REFERENCES
+            ],
             "",
             f"Approve with /approve {proposal_id}",
             f"Reject with /reject {proposal_id}",

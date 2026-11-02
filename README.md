@@ -27,7 +27,7 @@ Record the time you actually study, mark topics complete when you have finished 
 
 ### What AI does today—and what is planned
 
-Optional Gemini can reorder eligible topics in a daily queue. Deterministic rules still enforce prerequisites, time limits, and allocation. The goal-based learning-plan flow from [issue #28](https://github.com/Jonathan0823/study-habit-engine/issues/28) is now available in Telegram: use `/learn`, describe your goal and weekly study time, review a sourced proposal, then `/approve <proposal_id>` to activate it or `/reject <proposal_id>` to leave your active plan unchanged. Ongoing AI tutoring is a separate idea.
+Optional Gemini can reorder eligible topics in a daily queue. Deterministic rules still enforce prerequisites, time limits, and allocation. The goal-based learning-plan flow from [issue #28](https://github.com/Jonathan0823/study-habit-engine/issues/28) is now available in Telegram: use `/learn`, describe your goal and weekly study time, review the sourced proposal and clearly labeled AI self-review notes, then `/approve <proposal_id>` to activate it or `/reject <proposal_id>` to leave your active plan unchanged. The self-review is guidance, not proof of effectiveness; see the [quality-review rubric](docs/design/learning-plan-quality-rubric.md). Ongoing AI tutoring is a separate idea.
 
 ## How planning works
 

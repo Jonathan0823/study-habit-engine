@@ -7,6 +7,34 @@ import re
 from urllib.parse import urlsplit
 
 _ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+QUALITY_CRITERIA = (
+    "goal_coverage",
+    "objective_assessment_alignment",
+    "topic_sequence",
+    "practice_and_retrieval",
+    "scope_and_workload",
+)
+QUALITY_CRITERIA_GUIDANCE = {
+    "goal_coverage": "Outcomes and topics address the learner's goal without unnecessary breadth.",
+    "objective_assessment_alignment": "Each observable outcome has an assessment that would reveal it.",
+    "topic_sequence": "Topics build from prerequisite foundations toward application or synthesis.",
+    "practice_and_retrieval": "Activities require active recall or application, not only consuming materials.",
+    "scope_and_workload": "Topic estimates fit the learner's weekly budget and proposed duration.",
+}
+QUALITY_REFERENCES = (
+    {
+        "title": "Carnegie Mellon Eberly Center: Course Content & Schedule",
+        "url": "https://www.cmu.edu/teaching/designteach/design/contentschedule.html",
+    },
+    {
+        "title": "Carnegie Mellon Eberly Center: Align Assessments, Objectives, Instructional Strategies",
+        "url": "https://www.cmu.edu/teaching/assessment/basics/alignment.html",
+    },
+    {
+        "title": "The Learning Scientists: Six Strategies for Effective Learning",
+        "url": "https://www.learningscientists.org/blog/2019/11/28-1",
+    },
+)
 
 
 def validate_learning_plan(
@@ -27,6 +55,7 @@ def validate_learning_plan(
         "duration_weeks",
         "outcomes",
         "topics",
+        "quality_review",
     }:
         return ["INVALID_PLAN_SHAPE"]
     if not _nonempty(plan.get("goal_summary"), 2000):
@@ -132,6 +161,13 @@ def validate_learning_plan(
     if _has_cycle(dependency_graph):
         errors.append("PREREQUISITE_CYCLE")
 
+    _validate_quality_review(
+        plan.get("quality_review"),
+        topic_ids=set(topic_by_id),
+        outcome_ids=outcome_ids,
+        errors=errors,
+    )
+
     if (
         type(duration) is int
         and 1 <= duration <= 104
@@ -143,6 +179,68 @@ def validate_learning_plan(
     ):
         errors.append("ESTIMATES_EXCEED_AVAILABLE_TIME")
     return errors
+
+
+def _validate_quality_review(
+    review: object,
+    *,
+    topic_ids: set[str],
+    outcome_ids: set[str],
+    errors: list[str],
+) -> None:
+    if not isinstance(review, list) or len(review) != len(QUALITY_CRITERIA):
+        errors.append("INVALID_QUALITY_REVIEW")
+        return
+    by_criterion = {}
+    for item in review:
+        if not isinstance(item, dict) or set(item) != {
+            "criterion",
+            "evidence",
+            "topic_ids",
+            "outcome_ids",
+        }:
+            errors.append("INVALID_QUALITY_REVIEW_ITEM")
+            continue
+        criterion = item.get("criterion")
+        if criterion not in QUALITY_CRITERIA or criterion in by_criterion:
+            errors.append("INVALID_QUALITY_REVIEW_CRITERION")
+            continue
+        if not _nonempty(item.get("evidence"), 1000):
+            errors.append("INVALID_QUALITY_REVIEW_EVIDENCE")
+        related_topics = item.get("topic_ids")
+        related_outcomes = item.get("outcome_ids")
+        valid_topics = isinstance(related_topics, list) and all(
+            isinstance(value, str) for value in related_topics
+        )
+        if (
+            not valid_topics
+            or not related_topics
+            or len(related_topics) != len(set(related_topics))
+            or not set(related_topics) <= topic_ids
+        ):
+            errors.append("INVALID_QUALITY_REVIEW_TOPICS")
+        valid_outcomes = isinstance(related_outcomes, list) and all(
+            isinstance(value, str) for value in related_outcomes
+        )
+        if (
+            not valid_outcomes
+            or len(related_outcomes) != len(set(related_outcomes))
+            or not set(related_outcomes) <= outcome_ids
+        ):
+            errors.append("INVALID_QUALITY_REVIEW_OUTCOMES")
+        by_criterion[criterion] = {
+            "topic_ids": related_topics if valid_topics else [],
+            "outcome_ids": related_outcomes if valid_outcomes else [],
+        }
+    if set(by_criterion) != set(QUALITY_CRITERIA):
+        errors.append("MISSING_QUALITY_REVIEW_CRITERIA")
+        return
+    for criterion, item in by_criterion.items():
+        if criterion in ("goal_coverage", "objective_assessment_alignment"):
+            if set(item["outcome_ids"]) != outcome_ids:
+                errors.append("INCOMPLETE_QUALITY_REVIEW_OUTCOMES")
+        if set(item["topic_ids"]) != topic_ids:
+            errors.append("INCOMPLETE_QUALITY_REVIEW_TOPICS")
 
 
 def _resource_errors(

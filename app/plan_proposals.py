@@ -168,6 +168,8 @@ async def create_plan_proposal(
         topic["prerequisites"] = [
             topic_id_map[item] for item in topic["prerequisites"]
         ]
+    for review in generated["quality_review"]:
+        review["topic_ids"] = [topic_id_map[item] for item in review["topic_ids"]]
 
     proposal_id = await repository.save_pending(
         operation_id, goal.strip(), context, generated
