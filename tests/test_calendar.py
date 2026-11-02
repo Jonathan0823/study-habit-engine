@@ -8,6 +8,7 @@ import pytest
 
 from app.calendar import (
     CalendarAuthRequired,
+    CalendarNotFound,
     GoogleCalendarClient,
     build_calendar_event,
 )
@@ -97,6 +98,39 @@ def test_google_calendar_client_uses_primary_events_and_private_file_credentials
     assert result["id"] == "shengine20261102"
     assert len(observed) == 2
     assert "refresh-secret" not in str(result)
+
+
+@pytest.mark.parametrize("status_code", [404, 410])
+def test_google_calendar_client_treats_missing_or_gone_events_as_not_found(
+    tmp_path, status_code
+):
+    credentials_file = tmp_path / "calendar.json"
+    credentials_file.write_text(
+        json.dumps(
+            {
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "refresh_token": "refresh-secret",
+            }
+        )
+    )
+    credentials_file.chmod(0o600)
+
+    def handler(request):
+        if request.url.path == "/token":
+            return httpx.Response(200, json={"access_token": "access-token"})
+        return httpx.Response(status_code)
+
+    async def fetch_event():
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = GoogleCalendarClient(credentials_file, http)
+        try:
+            with pytest.raises(CalendarNotFound):
+                await client.request("GET", "shengine20261102")
+        finally:
+            await http.aclose()
+
+    asyncio.run(fetch_event())
 
 
 def test_google_calendar_client_rejects_group_or_world_readable_credentials(tmp_path):

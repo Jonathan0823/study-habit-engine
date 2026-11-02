@@ -183,7 +183,7 @@ class GoogleCalendarClient:
             )
         except httpx.HTTPError as exc:
             raise CalendarTransientError("Calendar API request failed") from exc
-        if response.status_code == 404:
+        if response.status_code in (404, 410):
             raise CalendarNotFound("The app-owned Calendar event no longer exists")
         if response.status_code == 409:
             raise CalendarConflict("The stable Calendar event ID already exists")
@@ -297,10 +297,36 @@ async def sync_calendar_reminders(pool, client, now: datetime | None = None) -> 
             except CalendarNotFound:
                 existing = None
             if existing is not None:
-                if not _is_our_event(existing, study_date):
-                    raise CalendarError("The stable event ID is not owned by this application")
-                if row["payload_hash"] != row["synced_payload_hash"]:
-                    await client.request("PATCH", event_id, body=event)
+                if existing.get("status") == "cancelled":
+                    if row["ever_synced"]:
+                        await _set_calendar_state(
+                            pool,
+                            study_date,
+                            "suppressed",
+                            "EVENT_DELETED",
+                            ever_synced=True,
+                        )
+                        continue
+                    if not _is_our_event(existing, study_date):
+                        raise CalendarError(
+                            "The cancelled event is not confirmed as app-owned"
+                        )
+                    restored = await client.request(
+                        "PATCH", event_id, body={**event, "status": "confirmed"}
+                    )
+                    if (
+                        restored is None
+                        or restored.get("status") != "confirmed"
+                        or not _is_our_event(restored, study_date)
+                    ):
+                        raise CalendarError("Calendar did not confirm event restoration")
+                else:
+                    if not _is_our_event(existing, study_date):
+                        raise CalendarError(
+                            "The stable event ID is not owned by this application"
+                        )
+                    if row["payload_hash"] != row["synced_payload_hash"]:
+                        await client.request("PATCH", event_id, body=event)
             else:
                 if row["ever_synced"]:
                     await _set_calendar_state(

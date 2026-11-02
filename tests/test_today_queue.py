@@ -979,16 +979,29 @@ def test_routine_delivery_creates_today_plan_once_when_due(today_client):
             repeated_job = await next_job(pool)
             assert scheduled_job is not None
             assert repeated_job == scheduled_job
+            async with pool.acquire() as conn:
+                routine_operation = await conn.fetchval(
+                    "SELECT operation_id FROM planning_jobs WHERE job_id=$1",
+                    scheduled_job,
+                )
+                association_count = await conn.fetchval(
+                    "SELECT count(*) FROM planning_job_operations WHERE job_id=$1 AND operation_id=$2",
+                    scheduled_job,
+                    routine_operation,
+                )
             await process_job(pool, scheduled_job, uuid.uuid4())
             after_commit = await next_job(pool)
-            return before_due, before_job, after_commit
+            return before_due, before_job, after_commit, association_count
         finally:
             await pool.close()
 
-    before_due, before_job, after_commit = asyncio.run(run_ticks_and_plan())
+    before_due, before_job, after_commit, association_count = asyncio.run(
+        run_ticks_and_plan()
+    )
     assert before_due is False
     assert before_job is None
     assert after_commit is None
+    assert association_count == 1
 
     delivery = today_client.post(
         "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
@@ -1420,6 +1433,80 @@ def test_early_today_delivery_suppresses_duplicate_routine_telegram(today_client
         "/v1/deliveries/claim", headers={"Authorization": "Bearer bot-secret"}
     )
     assert duplicate.status_code == 204
+
+
+def test_calendar_restores_cancelled_unconfirmed_app_event(today_client):
+    study_date = _seed_calendar_plan(today_client)
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+    fake_calendar = _FakeCalendar()
+
+    async def restore():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            event_id = await pool.fetchval(
+                "SELECT event_id FROM calendar_reminders WHERE study_date=$1", study_date
+            )
+            fake_calendar.events[event_id] = {
+                "id": event_id,
+                "status": "cancelled",
+                "extendedProperties": {
+                    "private": {
+                        "app": "study-habit-engine",
+                        "study_date": study_date.isoformat(),
+                    }
+                },
+            }
+            await sync_calendar_reminders(
+                pool, fake_calendar, due - timedelta(minutes=5)
+            )
+            state = await pool.fetchval(
+                "SELECT state FROM calendar_reminders WHERE study_date=$1", study_date
+            )
+            return state, fake_calendar.events[event_id]
+        finally:
+            await pool.close()
+
+    state, restored = asyncio.run(restore())
+    assert state == "synced"
+    assert restored["status"] == "confirmed"
+    assert [call[0] for call in fake_calendar.calls] == ["GET", "PATCH"]
+    assert fake_calendar.calls[-1][2]["status"] == "confirmed"
+
+
+def test_calendar_suppresses_cancelled_previously_synced_event(today_client):
+    study_date = _seed_calendar_plan(today_client)
+    due = datetime.combine(
+        study_date, datetime.min.time(), ZoneInfo("Asia/Jakarta")
+    ).replace(hour=17)
+    fake_calendar = _FakeCalendar()
+
+    async def suppress():
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        try:
+            event_id = await pool.fetchval(
+                "SELECT event_id FROM calendar_reminders WHERE study_date=$1", study_date
+            )
+            await pool.execute(
+                "UPDATE calendar_reminders SET state='synced',ever_synced=true,next_check_at=$2 WHERE study_date=$1",
+                study_date,
+                due,
+            )
+            fake_calendar.events[event_id] = {
+                "id": event_id,
+                "status": "cancelled",
+            }
+            await sync_calendar_reminders(pool, fake_calendar, due)
+            state = await pool.fetchval(
+                "SELECT state FROM calendar_reminders WHERE study_date=$1", study_date
+            )
+            return state
+        finally:
+            await pool.close()
+
+    assert asyncio.run(suppress()) == "suppressed"
+    assert [call[0] for call in fake_calendar.calls] == ["GET"]
 
 
 def test_calendar_event_is_removed_when_queue_finishes_before_17(today_client):

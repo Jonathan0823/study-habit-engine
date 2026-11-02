@@ -71,6 +71,16 @@ cp .env.example .env
 
 Keep `.env` private; it is ignored by Git. Do not put real credentials in `.env.example` or commit them.
 
+The planning worker bind-mounts `GOOGLE_CALENDAR_SECRET_DIR` (default `./secrets`) read-only. Create the host directory before starting Compose, even if Calendar is not configured yet:
+
+```sh
+mkdir -p ./secrets
+# If GOOGLE_CALENDAR_SECRET_DIR is customized, create that path instead:
+mkdir -p /path/to/calendar-secrets
+```
+
+The custom path must match `GOOGLE_CALENDAR_SECRET_DIR` in `.env`; Compose mounts that host directory at the worker's `/run/secrets`.
+
 Start the stack:
 
 ```sh

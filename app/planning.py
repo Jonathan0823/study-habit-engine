@@ -745,13 +745,12 @@ async def run_routine_tick(pool: asyncpg.Pool, now: datetime | None = None) -> b
                 study_date,
                 generation,
             )
-        else:
-            await conn.execute(
-                """INSERT INTO planning_job_operations(operation_id,job_id)
-                   VALUES($1,$2)""",
-                operation_id,
-                active_job_id,
-            )
+        await conn.execute(
+            """INSERT INTO planning_job_operations(operation_id,job_id)
+               VALUES($1,$2)""",
+            operation_id,
+            active_job_id,
+        )
         return True
 
 
