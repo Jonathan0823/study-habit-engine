@@ -4,7 +4,7 @@ A single-user Telegram study planner that turns an approved curriculum into a pr
 
 Record the time you actually study, mark topics complete when you have finished learning them, and plan from the work that is eligible now. Study blocks are not fixed-time appointments, and a missed day does not create overdue work.
 
-> **Project status:** This repository contains a local implementation, but it is not production-ready. Planning is deterministic and model-free today. AI-assisted ranking is not implemented, and operational requirements such as backup and recovery have not been verified in production.
+> **Project status:** This repository contains a local implementation, but it is not production-ready. Planning is deterministic by default. Optional Gemini ranking can reorder eligible topics when explicitly enabled; deterministic validation, allocation, and fallback remain authoritative. Operational requirements such as backup and recovery have not been verified in production.
 
 ## What you can do
 
@@ -28,11 +28,11 @@ Record the time you actually study, mark topics complete when you have finished 
 - PostgreSQL stores curriculum, progress, plans, operations, planning jobs, and pending deliveries.
 - Telegram updates are admitted durably before the bot advances its polling offset, and duplicate updates do not repeat the underlying operation.
 - Outgoing messages use a database-backed delivery queue. Delivery is at-least-once: a lost send receipt can result in a duplicate message.
-- Planning currently uses deterministic rules. No AI service or model credentials are needed.
+- Deterministic code owns eligibility, allocation, and fallback. Optional Gemini ranking is disabled unless a key and explicit free-tier acknowledgement are configured.
 
 ## How planning works
 
-The planner creates a queue for the current day from eligible topics and the remaining time budget. It prioritizes topics with recorded study time, then follows curriculum order. Blocks are up to 30 minutes; the planner does not create a block shorter than 15 minutes. Planning time limits do not restrict truthful progress records: actual study time is recorded separately.
+The planner creates a queue for the current day from eligible topics and the remaining time budget. By default it prioritizes topics with recorded study time, then follows curriculum order. If explicitly enabled, Gemini can reorder eligible topics, but deterministic code still enforces prerequisite eligibility, started-topic priority, block duration, and capacity. Blocks are up to 30 minutes; the planner does not create a block shorter than 15 minutes. Planning time limits do not restrict truthful progress records: actual study time is recorded separately.
 
 Topics and study blocks are different things. A study block records a bounded session; completing it does not prove that a topic is complete. Topic completion is an explicit action that affects prerequisite eligibility.
 
@@ -97,6 +97,12 @@ See `.env.example` for the Compose variables:
 | `TELEGRAM_PRIVATE_CHAT_ID` | Numeric private chat ID. |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token; keep it secret. |
 | `DB_HOST_PORT` | Optional host port for PostgreSQL; defaults to `5432`. |
+| `GEMINI_API_KEY` | Optional key for Gemini topic ranking; leave empty for deterministic ranking only. |
+| `GEMINI_MODEL` | Pinned free-tier model ID; defaults to `gemini-3.8-flash`. Other unpriced model IDs are refused. |
+| `GEMINI_FREE_TIER_ACKNOWLEDGED` | Must be `true` to enable Gemini. Only set it after verifying the Google project is on the free tier. |
+| `AI_MAX_INPUT_TOKENS` / `AI_MAX_OUTPUT_TOKENS` | Conservative request limits; defaults are 8192 and 512. |
+
+Gemini is optional and disabled by default. When enabled, the worker makes at most one bounded request per planning job, validates the complete ranking, and falls back deterministically on errors, timeouts, invalid output, or exhausted local limits. The app reserves **$0** and does not intentionally spill over to paid usage. Billing is controlled by Google project/account settings; use a project that cannot incur paid usage if you require a hard $0 provider bill. Google may use free-tier request content to improve its products, so consider what curriculum details you send. Never send credentials, Telegram IDs, or unrelated personal data to the model.
 
 Compose reads `.env`, but commands run directly with `uv` do not. Before using the curriculum client, set `ADMIN_API_URL` and export `ADMIN_SERVICE_TOKEN` in your shell.
 
@@ -156,9 +162,9 @@ The script starts a disposable PostgreSQL/API stack, runs Python and Rust tests,
 
 - **Rust Telegram bot:** polls Telegram, submits updates to the API, and sends queued responses.
 - **Python FastAPI service:** authenticates the bot and curriculum operator and handles study and curriculum operations.
-- **Python planning worker:** processes durable jobs and builds deterministic queues.
+- **Python planning worker:** processes durable jobs, optionally requests a bounded Gemini ranking, and uses deterministic validation, allocation, and fallback.
 - **PostgreSQL:** stores curriculum, progress, plans, jobs, operations, and pending deliveries.
-- **LangGraph:** provides the worker's graph/checkpoint structure; the current planning path does not call an AI model.
+- **LangGraph:** provides the worker's graph/checkpoint structure; the optional Gemini ranking call runs within the planning path.
 
 ## Repository map
 
@@ -176,7 +182,7 @@ docs/agents/          Contributor and agent workflow guidance
 
 - The first version is for one authorized Telegram user, not a multi-user service.
 - Curriculum content and resources are manually reviewed; the engine does not generate or independently verify them.
-- AI-assisted ranking is not implemented.
+- AI-assisted ranking is optional, disabled by default, and limited to topic ordering; it does not generate topics or allocate study blocks.
 - Production readiness, backup and restore, external monitoring, and operational recovery have not been established or verified.
 - Telegram retains incoming updates for a limited time. A prolonged outage can mean an update was never accepted; recovery of every command is not guaranteed.
 
