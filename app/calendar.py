@@ -311,8 +311,12 @@ async def sync_calendar_reminders(pool, client, now: datetime | None = None) -> 
                         raise CalendarError(
                             "The cancelled event is not confirmed as app-owned"
                         )
+                    # Events.update is the full-resource operation that restores a
+                    # cancelled organizer event when its status is set to confirmed.
                     restored = await client.request(
-                        "PATCH", event_id, body={**event, "status": "confirmed"}
+                        "PUT",
+                        event_id,
+                        body={**event, "id": event_id, "status": "confirmed"},
                     )
                     if (
                         restored is None

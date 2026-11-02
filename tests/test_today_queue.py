@@ -1167,7 +1167,7 @@ class _FakeCalendar:
         if method == "POST":
             self.events[body["id"]] = dict(body)
             return self.events[body["id"]]
-        if method == "PATCH":
+        if method in {"PATCH", "PUT"}:
             self.events[event_id].update(body)
             return self.events[event_id]
         if method == "DELETE":
@@ -1471,7 +1471,7 @@ def test_calendar_restores_cancelled_unconfirmed_app_event(today_client):
     state, restored = asyncio.run(restore())
     assert state == "synced"
     assert restored["status"] == "confirmed"
-    assert [call[0] for call in fake_calendar.calls] == ["GET", "PATCH"]
+    assert [call[0] for call in fake_calendar.calls] == ["GET", "PUT"]
     assert fake_calendar.calls[-1][2]["status"] == "confirmed"
 
 
